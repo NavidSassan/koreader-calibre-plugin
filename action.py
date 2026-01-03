@@ -1033,12 +1033,18 @@ class KoreaderAction(InterfaceAction):
                 app_id = book_info['application_id']
 
                 # Use Calibre's matching (application_id)
-                book_id = app_id if app_id is not None else None
+                # Convert to int if it's a string
+                book_id = None
+                if app_id is not None:
+                    try:
+                        book_id = int(app_id)
+                    except (ValueError, TypeError):
+                        book_id = app_id
 
                 if not book_id:
                     debug_print(f'Book not matched by Calibre: app_id={app_id}, uuid={book_uuid}')
                     continue
-                debug_print(f'Using Calibre application_id: book_id={book_id}')
+                debug_print(f'Using Calibre application_id: app_id={app_id}, book_id={book_id}')
 
                 metadata = db.get_metadata(book_id)
                 title = metadata.get('title', 'Unknown')
@@ -1096,7 +1102,13 @@ class KoreaderAction(InterfaceAction):
                 app_id = book_info['application_id']
 
                 # Use Calibre's matching (application_id)
-                book_id = app_id if app_id is not None else None
+                # Convert to int if it's a string
+                book_id = None
+                if app_id is not None:
+                    try:
+                        book_id = int(app_id)
+                    except (ValueError, TypeError):
+                        book_id = app_id
                 calibre_uuid = None
 
                 if book_id:
@@ -1111,6 +1123,31 @@ class KoreaderAction(InterfaceAction):
 
                 if result == "success":
                     num_new_sidecars += 1
+
+                    # After restoring sidecar, also update with current Calibre column values
+                    if book_id and has_pushable_columns:
+                        # Read the just-created sidecar
+                        sidecar_contents = self.get_sidecar(device, sidecar_path)
+                        if not isinstance(sidecar_contents, GetSidecarStatus):
+                            # Collect fields to update from Calibre columns
+                            fields_to_update = {}
+                            for config_name, column_config in COLUMNS.items():
+                                if not column_config.get('push_to_device', True):
+                                    continue
+                                target_column = CONFIG.get(config_name, '')
+                                if not target_column or config_name == 'column_sidecar':
+                                    continue
+                                calibre_value = metadata.get(target_column)
+                                if calibre_value is not None:
+                                    fields_to_update[config_name] = calibre_value
+
+                            if fields_to_update:
+                                update_result, update_details = self.update_sidecar_fields(
+                                    sidecar_path, sidecar_contents, fields_to_update
+                                )
+                                if update_result == "success":
+                                    debug_print(f'Also updated {len(fields_to_update)} field(s) after restore')
+
                     results.append({
                         'title': title,
                         'result': 'New sidecar created',
@@ -1228,21 +1265,22 @@ class KoreaderAction(InterfaceAction):
                     results,
                     'warn'
                 )
-            elif num_no_metadata > 0 and num_fail == 0:
-                SyncCompletionDialog(
-                    self.gui,
-                    'No Updates',
-                    results_message,
-                    results,
-                    'info'
-                )
-            else:
+            elif num_fail > 0:
                 SyncCompletionDialog(
                     self.gui,
                     'Failure',
                     results_message,
                     results,
                     'error'
+                )
+            else:
+                # No updates needed (nothing to sync or all skipped)
+                SyncCompletionDialog(
+                    self.gui,
+                    'No Updates Needed',
+                    results_message,
+                    results,
+                    'info'
                 )
 
     def sync_progress_from_progresssync(self, silent=False):
