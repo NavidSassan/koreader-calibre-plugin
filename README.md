@@ -44,7 +44,7 @@ that thread.
 1. Pick and choose the metadata you would like to sync and create the
    appropriate columns in calibre. The plugin makes this easy, simply select
    the **create new columns** option in the config dropdowns.
-   
+
    These are your options:
    - A _Floating point numbers_ column to store the **current percent read**,
      with _Format for numbers_ set to `{:.0%}`.
@@ -64,7 +64,7 @@ that thread.
      markdown_. (Highlights are an unordered list with their metadata in an
      HTML comment.)
    - A regular _Text_ column to store the **MD5 hash** KOReader uses to sync
-     progress to a [KOReader Sync 
+     progress to a [KOReader Sync
      Server](https://github.com/koreader/koreader-sync-server#koreader-sync-server)
      (_Progress sync_ in the KOReader app). This allows for syncing
      progress and location to calibre without having to connect your KOReader device.
@@ -75,7 +75,7 @@ that thread.
    - A _Date_ column to store **when the book status was first marked finished**.
    - A _Long text_ column to store the **contents of the metadata sidecar** as
      HTML, with _Interpret this column as_ set to _HTML_.
-  
+
    There are additional settings for:
    - Sync only if changes are more recent: Checks retrieved **Last Sync Date** against date on file.
    - No sync if book has already been finished: If **percent read** is _100_ or if **reading status** is _finished_ don't update data.
@@ -101,7 +101,7 @@ changed/removed from `sidecar_contents` data structure:
 
 ### ProgressSync
 
-  This plugin supports use of a [KOReader Sync 
+  This plugin supports use of a [KOReader Sync
   Server](https://github.com/koreader/koreader-sync-server#koreader-sync-server)
   (_Progress sync_ in the KOReader app) in order to update **current percent read**
   (both float and int) and **location you last stopped reading at** wirelessly.\
@@ -110,16 +110,45 @@ changed/removed from `sidecar_contents` data structure:
   The user password is stored as a hash, not plain text.\
   You can have calibre fetch updated data on a daily schedule.
 
+### Syncing to KOReader (Bidirectional Sync)
+
+The plugin supports syncing metadata back to KOReader via "Sync to KOReader".
+When conflicts exist between Calibre and device values, a conflict resolution
+dialog for supported fields lets you choose per-field whether to keep Calibre's
+value, keep the device value, or skip.
+
+**Columns that can be synced to KOReader:**
+
+| Column | Notes |
+|--------|-------|
+| Progress (float) | Float value (0.0-1.0), synced as-is |
+| Progress (int) | Integer (0-100), converted back to float (e.g., 76 → 0.76). Sub-percentage precision is lost when syncing back. |
+| Book Status | Text value synced as-is (complete/reading/abandoned) |
+| Book Status Y/N | Converted: Yes → "complete", No → "reading" |
+| Last Location | Xpointer string synced as-is |
+| Rating | Converted from Calibre's 10-point to KOReader's 5-point scale (e.g., 8 → 4) |
+| Review | Text synced as-is |
+| MD5 Hash | Synced for sidecar restoration only. Do not manually modify - this is calculated by KOReader from file content. |
+
+**Columns that cannot be synced back:**
+
+| Column | Reason |
+|--------|--------|
+| Bookmarks/Highlights | Transformed to HTML, not reversible |
+| Date Started | Calculated field, not stored in sidecar |
+| Date Finished | Calculated field, not stored in sidecar |
+| Date Synced | Calculated field, not stored in sidecar |
+| Date Modified | Calculated field, not stored in sidecar |
+| Raw Sidecar | Used for full sidecar backup/restore only |
+
 ### Things to consider
 
-- The plugin overwrites existing metadata in Calibre without asking. That
-  usually isn’t a problem, because you will probably only add to KOReader’s
-  metadata. But be aware that you might lose data in calibre if you’re not
-  careful.
-- Pushing sidecars back to KOReader currently only happens for sidecars which
-  are missing. For now, manually delete the `<bookname>.sdr` folder from the
-  device before attempting to push the sidecars back to KOReader for any books
-  you would like to overwrite the current metadata with Calibre's metadata.
+- When syncing from KOReader, the plugin will show a conflict resolution dialog
+  for supported fields if Calibre and device values differ, letting you choose which to keep.
+- When syncing to KOReader, existing sidecars are updated field-by-field rather
+  than replaced entirely.
+- If the Raw Sidecar column is mapped and contains data, restoring a missing
+  sidecar will also apply current Calibre column values on top.
 - When pushing missing sidecars to the device, no attempt is made to convert
   Calibre's metadata to account for changes in KOReader's sidecar format. Old
   metadata may work unpredictably if it's from a different version of KOReader.
