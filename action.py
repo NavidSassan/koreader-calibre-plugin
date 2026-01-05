@@ -1582,6 +1582,8 @@ class KoreaderAction(InterfaceAction):
             sidecar_contents = self.get_sidecar(device, sidecar_path)
             if isinstance(sidecar_contents, GetSidecarStatus):
                 debug_print(f'  SKIP: Sidecar status = {sidecar_contents}')
+                # Track the skip reason for better messaging in Phase 3
+                sidecar_cache[book_key] = ('SKIP', sidecar_contents, None, sidecar_path, None)
                 continue
 
             # Use Calibre's matching - same logic as Calibre's "On Device" indicator
@@ -1693,14 +1695,26 @@ class KoreaderAction(InterfaceAction):
 
                     # Use cached sidecar if available (cache uses book_key)
                     if book_key in self.sidecar_cache:
-                        sidecar_contents, title, metadata, cached_path, book_id = self.sidecar_cache[book_key]
+                        cached_entry = self.sidecar_cache[book_key]
+                        # Check if this is a skip entry (sidecar not found, etc.)
+                        if cached_entry[0] == 'SKIP':
+                            skip_reason = cached_entry[1]  # GetSidecarStatus enum
+                            if skip_reason == GetSidecarStatus.PATH_NOT_FOUND:
+                                status = 'skipped, no KOReader sidecar (book not opened in KOReader yet?)'
+                            else:
+                                status = f'skipped, {skip_reason}'
+                            debug_print(f'  SKIP: {status}')
+                            append_results(results, book_info['title'], status, book_uuid or book_key, sidecar_path)
+                            num_skip += 1
+                            continue
+                        sidecar_contents, title, metadata, cached_path, book_id = cached_entry
                         calibre_uuid = metadata.get('uuid', 'NO UUID')
                         debug_print(f'  Using cached sidecar for: {title} (calibre_uuid: {calibre_uuid})')
                     else:
-                        debug_print(f'  Book key not in cache, skipping (not found in Calibre in Phase 1)')
-                        status = 'skipped, not found in Calibre library'
+                        debug_print(f'  Book key not in cache, skipping (not processed in Phase 1)')
+                        status = 'skipped, not matched by Calibre'
                         debug_print(f'  SKIP: {status}')
-                        append_results(results, None, status, book_uuid or book_key, sidecar_path)
+                        append_results(results, book_info['title'], status, book_uuid or book_key, sidecar_path)
                         num_skip += 1
                         continue
 
