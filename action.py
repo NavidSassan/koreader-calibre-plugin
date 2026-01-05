@@ -407,34 +407,34 @@ class KoreaderAction(InterfaceAction):
             'KoreaderAction:get_paths:'
         )
 
-        debug_print(
-            f'found {len(device.books())} paths to books:\n\t',
-            '\n\t'.join([book.path for book in device.books()])
-        )
-
-        debug_print(
-            f'found {len(device.books())} lpaths to books:\n\t',
-            '\n\t'.join([book.lpath for book in device.books()])
-        )
-
-        # Debug: print all available attributes on the first book
-        books = list(device.books())
-        if books:
-            sample_book = books[0]
-            debug_print(f'Sample book attributes: {dir(sample_book)}')
-            # Try common attributes
-            for attr in ['uuid', 'application_id', 'title', 'authors', 'path', 'lpath', 'id']:
-                if hasattr(sample_book, attr):
-                    debug_print(f'  {attr} = {getattr(sample_book, attr, "N/A")}')
+        # Use GUI's annotated book list instead of device.books()
+        # device.books() returns fresh objects without in_library set
+        # The GUI's memory_view.model().db has the annotated objects from set_books_in_library()
+        debug_print(f'Getting annotated books from GUI memory_view...')
+        try:
+            books = self.gui.memory_view.model().db
+            debug_print(f'  Got {len(books)} books from memory_view.model().db')
+            if books:
+                sample = books[0]
+                in_lib = getattr(sample, 'in_library', 'NOT_FOUND')
+                app_id = getattr(sample, 'application_id', 'NOT_FOUND')
+                debug_print(f'  Sample book: in_library={in_lib}, app_id={app_id}')
+        except Exception as e:
+            debug_print(f'  Failed to get annotated books: {e}, falling back to device.books()')
+            books = list(device.books())
 
         book_info = {}
         for book in books:
-            # Get application_id if available (this is the Calibre library book_id)
+            # Get matching info from Calibre
+            # in_library is set by Calibre to 'UUID', 'APP_ID', 'DB_ID', or None/False
+            # application_id is the matched book_id (integer) if matched, else may contain stale data
             app_id = getattr(book, 'application_id', None)
+            in_library = getattr(book, 'in_library', None)
             book_uuid = getattr(book, 'uuid', None)
+            db_id = getattr(book, 'db_id', None)
             title = getattr(book, 'title', 'Unknown')
 
-            debug_print(f'Book: "{title}" - uuid={book_uuid}, application_id={app_id}, path={book.path}')
+            debug_print(f'Book: "{title}" - uuid={book_uuid}, application_id={app_id}, in_library={in_library}, db_id={db_id}, path={book.path}')
 
             sidecar_path = re.sub(r'\.(\w+)$', r'.sdr/metadata.\1.lua', book.path)
 
@@ -445,6 +445,8 @@ class KoreaderAction(InterfaceAction):
                 'sidecar_path': sidecar_path,
                 'uuid': book_uuid,
                 'application_id': app_id,
+                'in_library': in_library,  # Calibre's match result: 'UUID', 'APP_ID', 'DB_ID', or None
+                'db_id': db_id,
                 'title': title,
                 'path': book.path
             }
@@ -1031,20 +1033,32 @@ class KoreaderAction(InterfaceAction):
                 sidecar_path = book_info['sidecar_path']
                 book_uuid = book_info['uuid']
                 app_id = book_info['application_id']
+                in_library = book_info.get('in_library')
+                db_id = book_info.get('db_id')
 
-                # Use Calibre's matching (application_id)
-                # Convert to int if it's a string
+                # Use Calibre's matching - same logic as Calibre's "On Device" indicator
+                if not in_library:
+                    debug_print(f'SKIP: Calibre did not match this book (in_library={in_library})')
+                    continue
+
+                debug_print(f'Calibre matched via: {in_library}')
                 book_id = None
-                if app_id is not None:
+
+                # Get book_id based on how Calibre matched
+                if in_library == 'DB_ID' and db_id is not None:
+                    book_id = db_id
+                elif app_id is not None:
                     try:
                         book_id = int(app_id)
                     except (ValueError, TypeError):
-                        book_id = app_id
+                        debug_print(f'ERROR: Calibre matched but application_id is not int: {app_id}')
+                        continue
 
                 if not book_id:
-                    debug_print(f'Book not matched by Calibre: app_id={app_id}, uuid={book_uuid}')
+                    debug_print(f'SKIP: Could not get book_id from Calibre match')
                     continue
-                debug_print(f'Using Calibre application_id: app_id={app_id}, book_id={book_id}')
+
+                debug_print(f'Using Calibre-matched book_id: {book_id}')
 
                 metadata = db.get_metadata(book_id)
                 title = metadata.get('title', 'Unknown')
@@ -1100,23 +1114,36 @@ class KoreaderAction(InterfaceAction):
                 sidecar_path = book_info['sidecar_path']
                 book_uuid = book_info['uuid']
                 app_id = book_info['application_id']
+                in_library = book_info.get('in_library')
+                db_id = book_info.get('db_id')
 
-                # Use Calibre's matching (application_id)
-                # Convert to int if it's a string
+                # Use Calibre's matching - same logic as Calibre's "On Device" indicator
+                if not in_library:
+                    debug_print(f'SKIP: Calibre did not match this book (in_library={in_library})')
+                    continue
+
+                debug_print(f'Calibre matched via: {in_library}')
                 book_id = None
-                if app_id is not None:
+
+                # Get book_id based on how Calibre matched
+                if in_library == 'DB_ID' and db_id is not None:
+                    book_id = db_id
+                elif app_id is not None:
                     try:
                         book_id = int(app_id)
                     except (ValueError, TypeError):
-                        book_id = app_id
-                calibre_uuid = None
+                        debug_print(f'ERROR: Calibre matched but application_id is not int: {app_id}')
+                        continue
 
-                if book_id:
-                    metadata = db.get_metadata(book_id)
-                    calibre_uuid = metadata.get('uuid')
-                    title = metadata.get('title', 'Unknown')
-                else:
-                    title = 'Unknown'
+                if not book_id:
+                    debug_print(f'SKIP: Could not get book_id from Calibre match')
+                    continue
+
+                debug_print(f'Using Calibre-matched book_id: {book_id}')
+
+                metadata = db.get_metadata(book_id)
+                calibre_uuid = metadata.get('uuid')
+                title = metadata.get('title', 'Unknown')
 
                 # Use calibre_uuid for push_metadata_to_koreader_sidecar
                 result, details = self.push_metadata_to_koreader_sidecar(calibre_uuid or book_uuid, sidecar_path)
@@ -1557,24 +1584,34 @@ class KoreaderAction(InterfaceAction):
                 debug_print(f'  SKIP: Sidecar status = {sidecar_contents}')
                 continue
 
-            # Use Calibre's matching (application_id) - this matches what Calibre shows in "On Device"
+            # Use Calibre's matching - same logic as Calibre's "On Device" indicator
+            in_library = book_info.get('in_library')
+            db_id = book_info.get('db_id')
             book_id = None
 
-            if app_id is not None:
-                # application_id is Calibre's book_id for matched books
-                # Convert to int if it's a string
+            # Only process books that Calibre has matched
+            if not in_library:
+                debug_print(f'  SKIP: Calibre did not match this book (in_library={in_library})')
+                continue
+
+            debug_print(f'  Calibre matched via: {in_library}')
+
+            # Get book_id based on how Calibre matched
+            if in_library == 'DB_ID' and db_id is not None:
+                book_id = db_id
+            elif app_id is not None:
                 try:
                     book_id = int(app_id)
                 except (ValueError, TypeError):
-                    book_id = app_id
-                debug_print(f'  Using Calibre application_id: app_id={app_id} (type={type(app_id).__name__}), book_id={book_id}')
-            else:
-                debug_print(f'  No application_id - book not matched by Calibre')
+                    debug_print(f'  ERROR: Calibre matched but application_id is not int: {app_id}')
+                    continue
 
             if not book_id:
-                debug_print(f'  SKIP: Book not found in Calibre library!')
-                debug_print(f'  Hint: Neither application_id ({app_id}) nor UUID ({book_uuid}) matched')
+                debug_print(f'  SKIP: Could not get book_id from Calibre match')
+                debug_print(f'  in_library={in_library}, app_id={app_id}, db_id={db_id}')
                 continue
+
+            debug_print(f'  Using Calibre-matched book_id: {book_id}')
 
             metadata = db.get_metadata(book_id)
             debug_print(f'  Raw metadata type: {type(metadata)}')
