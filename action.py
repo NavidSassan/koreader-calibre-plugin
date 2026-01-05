@@ -2,6 +2,7 @@
 
 """KOReader Sync Plugin for Calibre."""
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
 import io
@@ -11,6 +12,7 @@ import re
 import sys
 import importlib.util
 import time
+from typing import Any, List, Dict, Tuple, Optional
 
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -33,6 +35,9 @@ from PyQt5.Qt import (
     Qt,
     QThread,
     pyqtSignal,
+    QComboBox,
+    QHeaderView,
+    QAbstractItemView,
 )
 from PyQt5.QtGui import QPixmap
 
@@ -102,6 +107,19 @@ class OperationStatus(Enum):
     PASS = auto()
     FAIL = auto()
     SKIP = auto()
+
+
+@dataclass
+class ConflictItem:
+    """Represents a single conflict between Calibre and device values."""
+    book_uuid: str
+    book_title: str
+    sidecar_path: str
+    field_name: str           # config key, e.g., 'column_percent_read'
+    field_display_name: str   # human-readable, e.g., 'Reading Progress'
+    calibre_value: Any
+    device_value: Any
+    resolution: str = 'skip'  # 'calibre', 'device', 'skip'
 
 
 def is_system_path(path):
@@ -381,7 +399,8 @@ class KoreaderAction(InterfaceAction):
         on the device
 
         :param device: a device object
-        :return: a dict of uuids with corresponding paths to sidecars
+        :return: a dict of book_keys with corresponding book info dicts
+                 Each book info dict contains: sidecar_path, uuid, application_id, title
         """
         debug_print = partial(
             module_debug_print,
@@ -398,22 +417,44 @@ class KoreaderAction(InterfaceAction):
             '\n\t'.join([book.lpath for book in device.books()])
         )
 
-        for book in device.books():
-            debug_print(f'uuid to path: {book.uuid} - {book.path}')
+        # Debug: print all available attributes on the first book
+        books = list(device.books())
+        if books:
+            sample_book = books[0]
+            debug_print(f'Sample book attributes: {dir(sample_book)}')
+            # Try common attributes
+            for attr in ['uuid', 'application_id', 'title', 'authors', 'path', 'lpath', 'id']:
+                if hasattr(sample_book, attr):
+                    debug_print(f'  {attr} = {getattr(sample_book, attr, "N/A")}')
 
-        paths = {
-            book.uuid: re.sub(
-                r'\.(\w+)$', r'.sdr/metadata.\1.lua', book.path
-            )
-            for book in device.books()
-        }
+        book_info = {}
+        for book in books:
+            # Get application_id if available (this is the Calibre library book_id)
+            app_id = getattr(book, 'application_id', None)
+            book_uuid = getattr(book, 'uuid', None)
+            title = getattr(book, 'title', 'Unknown')
+
+            debug_print(f'Book: "{title}" - uuid={book_uuid}, application_id={app_id}, path={book.path}')
+
+            sidecar_path = re.sub(r'\.(\w+)$', r'.sdr/metadata.\1.lua', book.path)
+
+            # Use a unique key - prefer application_id, fall back to uuid, then path
+            key = app_id or book_uuid or book.path
+
+            book_info[key] = {
+                'sidecar_path': sidecar_path,
+                'uuid': book_uuid,
+                'application_id': app_id,
+                'title': title,
+                'path': book.path
+            }
 
         debug_print(
-            f'generated {len(paths)} path(s) to sidecar Lua files:\n\t',
-            '\n\t'.join(paths.values())
+            f'generated {len(book_info)} path(s) to sidecar Lua files:\n\t',
+            '\n\t'.join([info['sidecar_path'] for info in book_info.values()])
         )
 
-        return paths
+        return book_info
 
     def get_sidecar(self, device, path):
         """Requests the given path from the given device and returns the
@@ -460,10 +501,101 @@ class KoreaderAction(InterfaceAction):
 
         return parsed_contents
 
-    def update_metadata(self, uuid, db, keys_values_to_update):
+    def detect_conflicts(self, book_uuid: str, book_title: str, sidecar_path: str,
+                         calibre_metadata, sidecar_contents: dict,
+                         direction: str) -> List[ConflictItem]:
+        """Compare Calibre metadata with device sidecar, return list of conflicts.
+
+        :param book_uuid: The book's UUID in Calibre
+        :param book_title: The book's title for display
+        :param sidecar_path: Path to the sidecar file
+        :param calibre_metadata: Calibre's current metadata object for the book
+        :param sidecar_contents: Parsed sidecar dict from device
+        :param direction: 'to_calibre' or 'to_device'
+        :return: List of ConflictItem objects for any differing values
+        """
+        debug_print = partial(
+            module_debug_print,
+            'KoreaderAction:detect_conflicts:'
+        )
+        conflicts = []
+
+        for config_name, column_config in COLUMNS.items():
+            target_column = CONFIG.get(config_name, '')
+            if not target_column:
+                continue
+
+            # Skip columns that shouldn't be pushed to device
+            if direction == 'to_device' and not column_config.get('push_to_device', True):
+                continue
+
+            # Skip calculated columns for conflict detection
+            data_location = column_config.get('data_location', [])
+            if data_location and data_location[0] == 'calculated':
+                continue
+
+            # Get device value via data_location
+            device_value = sidecar_contents
+            for key in data_location:
+                if isinstance(device_value, dict) and key in device_value:
+                    device_value = device_value[key]
+                else:
+                    device_value = None
+                    break
+
+            # Apply transform for comparison (device -> calibre format)
+            if device_value is not None and 'transform' in column_config:
+                try:
+                    device_value_transformed = column_config['transform'](device_value)
+                except Exception as e:
+                    debug_print(f'Transform failed for {config_name}: {e}')
+                    device_value_transformed = device_value
+            else:
+                device_value_transformed = device_value
+
+            # Get Calibre value
+            calibre_value = calibre_metadata.get(target_column)
+            debug_print(f'  {config_name}: target_column={target_column}, calibre_value={calibre_value}, device_value={device_value_transformed}')
+
+            # Normalize for comparison (handle None, type differences)
+            def normalize_value(val):
+                if val is None:
+                    return None
+                if isinstance(val, float):
+                    return round(val, 6)  # Avoid floating point comparison issues
+                return val
+
+            calibre_normalized = normalize_value(calibre_value)
+            device_normalized = normalize_value(device_value_transformed)
+
+            # Compare values - only add conflict if they differ
+            if calibre_normalized != device_normalized:
+                # Don't report conflict if both are None/empty
+                if calibre_normalized is None and device_normalized is None:
+                    continue
+                # Don't report conflict if one is empty string and other is None
+                if (calibre_normalized == '' and device_normalized is None) or \
+                   (calibre_normalized is None and device_normalized == ''):
+                    continue
+
+                conflicts.append(ConflictItem(
+                    book_uuid=book_uuid,
+                    book_title=book_title,
+                    sidecar_path=sidecar_path,
+                    field_name=config_name,
+                    field_display_name=column_config.get('column_heading', config_name),
+                    calibre_value=calibre_value,
+                    device_value=device_value_transformed,
+                ))
+                debug_print(f'Conflict found: {book_title} - {config_name}: '
+                           f'Calibre={calibre_value}, Device={device_value_transformed}')
+
+        return conflicts
+
+    def update_metadata(self, book_id_or_uuid, db, keys_values_to_update):
         """Update multiple metadata columns for the given book.
 
-        :param uuid: identifier for the book
+        :param book_id_or_uuid: either a numeric book_id or a UUID string
         :param keys_values_to_update: a dict of keys to update with values
         :return: a dict of values that can be used to report back to the user
         """
@@ -472,16 +604,23 @@ class KoreaderAction(InterfaceAction):
             'KoreaderAction:update_metadata:'
         )
 
+        # If we got a numeric book_id, use it directly; otherwise look up by UUID
+        # Handle int, numpy int, or string that looks like an int
         try:
-            debug_print('Looking for uuid in calibre db: ', uuid)
-            book_id = db.lookup_by_uuid(uuid)
-        except:
-            book_id = None
+            book_id = int(book_id_or_uuid)
+            debug_print(f'Using book_id directly: {book_id}')
+        except (ValueError, TypeError):
+            # It's a UUID string, look it up
+            try:
+                debug_print('Looking for uuid in calibre db: ', book_id_or_uuid)
+                book_id = db.lookup_by_uuid(book_id_or_uuid)
+            except:
+                book_id = None
 
         if not book_id:
-            debug_print(f'could not find {uuid} in calibre\'s library')
+            debug_print(f'could not find {book_id_or_uuid} in calibre\'s library')
             return OperationStatus.SKIP, {
-                'result': 'could not find uuid in calibre\'s library, have you deleted this book from library?'}
+                'result': 'could not find book in calibre\'s library, have you deleted this book from library?'}
 
         # Get the current metadata for the book from the library
         metadata = db.get_metadata(book_id)
@@ -587,23 +726,29 @@ class KoreaderAction(InterfaceAction):
         if len(updates) == 0:
             updateLog['result'] = 'no updates needed'
             debug_print(
-                'no changed metadata for uuid = ', uuid,
-                ', id = ', book_id
+                'no changed metadata for book_id = ', book_id
             )
         elif DEBUG and DRY_RUN:
             debug_print(
-                'would have updated the following fields for uuid = ',
-                uuid, ', id = ', book_id, ': ', updates
+                'would have updated the following fields for book_id = ',
+                book_id, ': ', updates
             )
         else:
-            db.set_metadata(
-                book_id, metadata, set_title=False,
-                set_authors=False
-            )
-            debug_print(
-                'updated the following fields for uuid = ', uuid,
-                ', id = ', book_id, ': ', updates
-            )
+            try:
+                db.set_metadata(
+                    book_id, metadata, set_title=False,
+                    set_authors=False
+                )
+                debug_print(
+                    'updated the following fields for book_id = ', book_id,
+                    ': ', updates
+                )
+            except Exception as e:
+                debug_print(f'Failed to set metadata for book_id {book_id}: {e}')
+                return OperationStatus.FAIL, {
+                    'result': f'Failed to update: {str(e)}',
+                    'error': True
+                }
 
         return OperationStatus.PASS, {
             'result': 'success',
@@ -729,13 +874,105 @@ class KoreaderAction(InterfaceAction):
             'result': 'success',
         }
 
-    def sync_missing_sidecars_to_koreader(self, silent=False):
-        """Push the content of Calibre's raw metadata column to KOReader
-        for any files which are missing in KOReader. Does not touch existing
-        metadata sidecars on KOReader.
+    def update_sidecar_fields(self, sidecar_path: str, current_sidecar: dict,
+                              fields_to_update: Dict[str, Any]) -> Tuple[str, dict]:
+        """Update specific fields in an existing sidecar file.
 
-        Intended for e.g. setting up a new device and syncing to it for the first
-        time.
+        :param sidecar_path: Path to sidecar Lua file on device
+        :param current_sidecar: Already-parsed sidecar dict (without 'calculated' key)
+        :param fields_to_update: Dict mapping config_name -> calibre_value
+        :return: Tuple of (status, details)
+        """
+        debug_print = partial(
+            module_debug_print,
+            'KoreaderAction:update_sidecar_fields:'
+        )
+
+        # Make a deep copy to avoid modifying the original
+        import copy
+        modified_sidecar = copy.deepcopy(current_sidecar)
+
+        # Remove 'calculated' key if present (it's not part of the real sidecar)
+        if 'calculated' in modified_sidecar:
+            del modified_sidecar['calculated']
+
+        fields_updated = []
+
+        for config_name, calibre_value in fields_to_update.items():
+            column_config = COLUMNS.get(config_name)
+            if not column_config:
+                debug_print(f'Unknown config_name: {config_name}')
+                continue
+
+            # Skip columns that shouldn't be pushed to device
+            if not column_config.get('push_to_device', True):
+                debug_print(f'Skipping {config_name} - not pushable to device')
+                continue
+
+            # Apply reverse transform if available
+            if 'reverse_transform' in column_config and calibre_value is not None:
+                try:
+                    device_value = column_config['reverse_transform'](calibre_value)
+                except Exception as e:
+                    debug_print(f'Reverse transform failed for {config_name}: {e}')
+                    device_value = calibre_value
+            else:
+                device_value = calibre_value
+
+            # Set value at data_location path
+            data_location = column_config.get('data_location', [])
+            if not data_location:
+                debug_print(f'No data_location for {config_name}')
+                continue
+
+            # Navigate to parent dict and set the value
+            target = modified_sidecar
+            for i, key in enumerate(data_location[:-1]):
+                if key not in target:
+                    target[key] = {}
+                target = target[key]
+
+            # Set the final key
+            final_key = data_location[-1]
+            target[final_key] = device_value
+            fields_updated.append(config_name)
+            debug_print(f'Set {config_name} ({data_location}) = {device_value}')
+
+        if not fields_updated:
+            return "no_updates", {
+                'result': 'No fields to update',
+            }
+
+        # Encode to Lua and write
+        try:
+            sidecar_lua = lua.encode(modified_sidecar)
+            # Fix integer keys (JSON uses string keys)
+            sidecar_lua = re.sub(r'\["(\d+)"\]', r'[\1]', sidecar_lua)
+            sidecar_lua_formatted = f"-- we can read Lua syntax here!\nreturn {sidecar_lua}\n"
+
+            with open(sidecar_path, "w", encoding="utf-8") as f:
+                debug_print(f"Writing updated sidecar to {sidecar_path}")
+                f.write(sidecar_lua_formatted)
+
+            return "success", {
+                'result': 'success',
+                'fields_updated': fields_updated,
+            }
+        except PermissionError as perm_e:
+            return "failure", {
+                'result': f'Permission denied writing to {sidecar_path}: {perm_e}',
+            }
+        except OSError as os_e:
+            return "failure", {
+                'result': f'Error writing sidecar: {os_e}',
+            }
+
+    def sync_missing_sidecars_to_koreader(self, silent=False):
+        """Push metadata from Calibre to KOReader sidecars.
+
+        For books WITHOUT sidecars: creates new sidecar from raw sidecar column.
+        For books WITH sidecars: detects conflicts and updates individual fields
+        based on user resolution.
 
         :return:
         """
@@ -744,11 +981,18 @@ class KoreaderAction(InterfaceAction):
             'KoreaderAction:sync_missing_sidecars_to_koreader:'
         )
 
-        if CONFIG["column_sidecar"] == '':
+        # Check if we have at least the raw sidecar column or some pushable columns
+        has_sidecar_column = CONFIG.get("column_sidecar", '') != ''
+        has_pushable_columns = any(
+            CONFIG.get(config_name, '') != '' and column_config.get('push_to_device', True)
+            for config_name, column_config in COLUMNS.items()
+        )
+
+        if not has_sidecar_column and not has_pushable_columns:
             error_dialog(
                 self.gui,
                 'Failure',
-                'Raw metadata column not mapped, impossible to push metadata to sidecars',
+                'No pushable columns are mapped. Please configure at least one column in plugin settings.',
                 show=True,
                 show_copy_button=False
             )
@@ -759,74 +1003,253 @@ class KoreaderAction(InterfaceAction):
         if not self.check_device(device):
             return None
 
-        sidecar_paths = self.get_paths(device)
-        debug_print('sidecar_paths: ', sidecar_paths)
-        sidecar_paths_exist = {}
-        sidecar_paths_not_exist = {}
-        for book_uuid, path in sidecar_paths.items():
-            if os.path.exists(path):
-                sidecar_paths_exist[book_uuid] = path
+        db = self.gui.current_db.new_api
+        book_info_dict = self.get_paths(device)
+        debug_print('book_info_dict: ', book_info_dict)
+
+        # Separate existing vs missing sidecars
+        books_with_sidecar = {}    # book_key -> book_info
+        books_without_sidecar = {} # book_key -> book_info
+        for book_key, book_info in book_info_dict.items():
+            sidecar_path = book_info['sidecar_path']
+            if os.path.exists(sidecar_path):
+                books_with_sidecar[book_key] = book_info
             else:
-                sidecar_paths_not_exist[book_uuid] = path
+                books_without_sidecar[book_key] = book_info
+
         debug_print(
-            "Sidecars not present on device:",
-            "\n".join(sidecar_paths_not_exist.values())
+            f"Sidecars not present on device: {len(books_without_sidecar)}",
+            f"Sidecars present on device: {len(books_with_sidecar)}"
         )
 
+        # Collect conflicts for existing sidecars
+        all_conflicts = []
+        sidecar_cache = {}  # Cache: book_key -> (sidecar_contents, book_id, calibre_uuid)
+
+        for book_key, book_info in books_with_sidecar.items():
+            try:
+                sidecar_path = book_info['sidecar_path']
+                book_uuid = book_info['uuid']
+                app_id = book_info['application_id']
+
+                # Use Calibre's matching (application_id)
+                # Convert to int if it's a string
+                book_id = None
+                if app_id is not None:
+                    try:
+                        book_id = int(app_id)
+                    except (ValueError, TypeError):
+                        book_id = app_id
+
+                if not book_id:
+                    debug_print(f'Book not matched by Calibre: app_id={app_id}, uuid={book_uuid}')
+                    continue
+                debug_print(f'Using Calibre application_id: app_id={app_id}, book_id={book_id}')
+
+                metadata = db.get_metadata(book_id)
+                title = metadata.get('title', 'Unknown')
+                calibre_uuid = metadata.get('uuid', 'NO UUID')
+
+                # Get sidecar contents
+                sidecar_contents = self.get_sidecar(device, sidecar_path)
+                if isinstance(sidecar_contents, GetSidecarStatus):
+                    debug_print(f'Could not read sidecar for {title}: {sidecar_contents}')
+                    continue
+
+                # Cache the sidecar for later use
+                sidecar_cache[book_key] = (sidecar_contents, book_id, calibre_uuid)
+
+                # Detect conflicts - use calibre_uuid for consistency
+                conflicts = self.detect_conflicts(
+                    calibre_uuid, title, sidecar_path, metadata, sidecar_contents, 'to_device'
+                )
+                all_conflicts.extend(conflicts)
+
+            except Exception as e:
+                debug_print(f'Error processing {book_key}: {e}')
+                continue
+
+        # Show conflict resolution dialog if there are conflicts
+        resolved_conflicts = []
+        if all_conflicts and not silent:
+            dialog = ConflictResolutionDialog(self.gui, all_conflicts, 'to_device')
+            if dialog.exec_() == QDialog.Accepted:
+                resolved_conflicts = dialog.get_resolved_conflicts()
+            else:
+                # User cancelled
+                info_dialog(
+                    self.gui,
+                    'Cancelled',
+                    'Sync to KOReader was cancelled.',
+                    show=True,
+                    show_copy_button=False
+                )
+                return None
+
+        # Process results
         results = []
-        num_candidates = len(sidecar_paths_not_exist)
-        num_success = 0
+        num_new_sidecars = 0
+        num_updated_sidecars = 0
         num_no_metadata = 0
         num_fail = 0
-        for book_uuid, path in sidecar_paths_not_exist.items():
-            result, details = self.push_metadata_to_koreader_sidecar(book_uuid,
-                                                                     path)
-            if result == "success":
-                num_success += 1
-                results.append(
-                    {
-                        **details,
-                        'book_uuid': book_uuid,
-                        'sidecar_path': path,
-                    }
-                )
-            elif result == "failure":
-                num_fail += 1
-                results.append(
-                    {
-                        **details,
-                        'book_uuid': book_uuid,
-                        'sidecar_path': path,
-                    }
-                )
-            elif result == "no_metadata":
-                num_no_metadata += 1
-                results.append(
-                    {
-                        **details,
-                        'book_uuid': book_uuid,
-                        'sidecar_path': path,
-                    }
-                )
+        num_skipped = 0
 
+        # Process books WITHOUT sidecars (create new from raw sidecar column)
+        if has_sidecar_column:
+            for book_key, book_info in books_without_sidecar.items():
+                sidecar_path = book_info['sidecar_path']
+                book_uuid = book_info['uuid']
+                app_id = book_info['application_id']
+
+                # Use Calibre's matching (application_id)
+                # Convert to int if it's a string
+                book_id = None
+                if app_id is not None:
+                    try:
+                        book_id = int(app_id)
+                    except (ValueError, TypeError):
+                        book_id = app_id
+                calibre_uuid = None
+
+                if book_id:
+                    metadata = db.get_metadata(book_id)
+                    calibre_uuid = metadata.get('uuid')
+                    title = metadata.get('title', 'Unknown')
+                else:
+                    title = 'Unknown'
+
+                # Use calibre_uuid for push_metadata_to_koreader_sidecar
+                result, details = self.push_metadata_to_koreader_sidecar(calibre_uuid or book_uuid, sidecar_path)
+
+                if result == "success":
+                    num_new_sidecars += 1
+
+                    # After restoring sidecar, also update with current Calibre column values
+                    if book_id and has_pushable_columns:
+                        # Read the just-created sidecar
+                        sidecar_contents = self.get_sidecar(device, sidecar_path)
+                        if not isinstance(sidecar_contents, GetSidecarStatus):
+                            # Collect fields to update from Calibre columns
+                            fields_to_update = {}
+                            for config_name, column_config in COLUMNS.items():
+                                if not column_config.get('push_to_device', True):
+                                    continue
+                                target_column = CONFIG.get(config_name, '')
+                                if not target_column or config_name == 'column_sidecar':
+                                    continue
+                                calibre_value = metadata.get(target_column)
+                                if calibre_value is not None:
+                                    fields_to_update[config_name] = calibre_value
+
+                            if fields_to_update:
+                                update_result, update_details = self.update_sidecar_fields(
+                                    sidecar_path, sidecar_contents, fields_to_update
+                                )
+                                if update_result == "success":
+                                    debug_print(f'Also updated {len(fields_to_update)} field(s) after restore')
+
+                    results.append({
+                        'title': title,
+                        'result': 'New sidecar created',
+                        'book_uuid': calibre_uuid or book_uuid,
+                        'sidecar_path': sidecar_path,
+                    })
+                elif result == "failure":
+                    num_fail += 1
+                    results.append({
+                        'title': title,
+                        **details,
+                        'book_uuid': calibre_uuid or book_uuid,
+                        'sidecar_path': sidecar_path,
+                    })
+                elif result == "no_metadata":
+                    num_no_metadata += 1
+                    results.append({
+                        'title': title,
+                        **details,
+                        'book_uuid': calibre_uuid or book_uuid,
+                        'sidecar_path': sidecar_path,
+                    })
+
+        # Process resolved conflicts (update existing sidecars)
+        # Build lookup from calibre_uuid to book_key (since conflicts use calibre_uuid)
+        uuid_to_book_key = {}
+        for book_key, (sidecar_contents, book_id, calibre_uuid) in sidecar_cache.items():
+            uuid_to_book_key[calibre_uuid] = book_key
+
+        if resolved_conflicts:
+            # Group conflicts by book (using calibre_uuid)
+            conflicts_by_uuid = {}
+            for conflict in resolved_conflicts:
+                if conflict.book_uuid not in conflicts_by_uuid:
+                    conflicts_by_uuid[conflict.book_uuid] = []
+                conflicts_by_uuid[conflict.book_uuid].append(conflict)
+
+            for calibre_uuid, book_conflicts in conflicts_by_uuid.items():
+                # Find the book_key from calibre_uuid
+                book_key = uuid_to_book_key.get(calibre_uuid)
+                if not book_key:
+                    debug_print(f'Could not find book_key for uuid {calibre_uuid}')
+                    continue
+
+                book_info = books_with_sidecar.get(book_key)
+                if not book_info:
+                    continue
+                sidecar_path = book_info['sidecar_path']
+
+                # Get cached sidecar
+                cached = sidecar_cache.get(book_key)
+                if not cached:
+                    continue
+                sidecar_contents, book_id, _ = cached
+
+                metadata = db.get_metadata(book_id) if book_id else None
+                title = metadata.get('title', 'Unknown') if metadata else 'Unknown'
+
+                # Collect fields to update (where resolution is 'calibre')
+                fields_to_update = {}
+                for conflict in book_conflicts:
+                    if conflict.resolution == 'calibre':
+                        fields_to_update[conflict.field_name] = conflict.calibre_value
+                    elif conflict.resolution == 'skip':
+                        num_skipped += 1
+
+                if fields_to_update:
+                    result, details = self.update_sidecar_fields(
+                        sidecar_path, sidecar_contents, fields_to_update
+                    )
+                    if result == "success":
+                        num_updated_sidecars += 1
+                        results.append({
+                            'title': title,
+                            'result': f'Updated {len(fields_to_update)} field(s)',
+                            'book_uuid': calibre_uuid,
+                            'sidecar_path': sidecar_path,
+                            **details,
+                        })
+                    else:
+                        num_fail += 1
+                        results.append({
+                            'title': title,
+                            **details,
+                            'book_uuid': calibre_uuid,
+                            'sidecar_path': sidecar_path,
+                        })
+
+        # Show results dialog
         if not silent:
             results_message = (
-                f'{num_candidates} books on device without sidecars.\n'
-                f'Sidecar creation succeeded for {num_success}.\n'
-                f'Sidecar creation failed for {num_fail}.\n'
-                f'No attempt made for {num_no_metadata} (no metadata in Calibre to push).\n'
-                f'See below for details.'
+                f'Books on device without sidecars: {len(books_without_sidecar)}\n'
+                f'Books on device with sidecars: {len(books_with_sidecar)}\n\n'
+                f'New sidecars created: {num_new_sidecars}\n'
+                f'Existing sidecars updated: {num_updated_sidecars}\n'
+                f'Fields skipped: {num_skipped}\n'
+                f'Failed: {num_fail}\n'
+                f'No metadata to push: {num_no_metadata}\n'
             )
 
-            if num_success > 0 and num_fail > 0:
-                SyncCompletionDialog(
-                    self.gui,
-                    'Results',
-                    results_message,
-                    results,
-                    'warn'
-                )
-            elif num_success > 0 or num_no_metadata > 0:  # and num_fail == 0
+            total_success = num_new_sidecars + num_updated_sidecars
+            if total_success > 0 and num_fail == 0:
                 SyncCompletionDialog(
                     self.gui,
                     'Success',
@@ -834,13 +1257,30 @@ class KoreaderAction(InterfaceAction):
                     results,
                     'info'
                 )
-            else:
+            elif total_success > 0 and num_fail > 0:
+                SyncCompletionDialog(
+                    self.gui,
+                    'Partial Success',
+                    results_message,
+                    results,
+                    'warn'
+                )
+            elif num_fail > 0:
                 SyncCompletionDialog(
                     self.gui,
                     'Failure',
                     results_message,
                     results,
                     'error'
+                )
+            else:
+                # No updates needed (nothing to sync or all skipped)
+                SyncCompletionDialog(
+                    self.gui,
+                    'No Updates Needed',
+                    results_message,
+                    results,
+                    'info'
                 )
 
     def sync_progress_from_progresssync(self, silent=False):
@@ -972,7 +1412,7 @@ class KoreaderAction(InterfaceAction):
                     # Update only if there are differences
                     if keys_values_to_update:
                         operation_status, result = self.update_metadata(
-                            book_uuid, db, keys_values_to_update)
+                            book_id, db, keys_values_to_update)
                     else:
                         result = {}
 
@@ -1067,8 +1507,11 @@ class KoreaderAction(InterfaceAction):
         main()  # Runs scheduled_progress_sync
 
     def sync_to_calibre(self, silent=False):
-        """This plugin’s main purpose. It syncs the contents of
-        KOReader’s metadata sidecar files into calibre’s metadata.
+        """This plugin's main purpose. It syncs the contents of
+        KOReader's metadata sidecar files into calibre's metadata.
+
+        Now includes conflict detection: before syncing, compares device
+        and Calibre values and shows a resolution dialog for conflicts.
 
         :return:
         """
@@ -1082,18 +1525,120 @@ class KoreaderAction(InterfaceAction):
         if not self.check_device(device):
             return None
 
-        sidecar_paths = self.get_paths(device)
-        debug_print('sidecar_paths:', sidecar_paths)
+        db = self.gui.current_db.new_api
+        debug_print(f'Current library path: {self.gui.current_db.library_path}')
+        debug_print(f'All book IDs in library: {sorted(db.all_book_ids())}')
+        book_info_dict = self.get_paths(device)
+        debug_print('book_info_dict:', book_info_dict)
 
+        # Phase 1: Collect sidecars and detect conflicts
+        all_conflicts = []
+        sidecar_cache = {}  # Cache: book_key -> (sidecar_contents, title, metadata, sidecar_path)
+
+        if not silent:
+            # Show a simple progress message while collecting sidecars
+            progress = ProgressDialog(self.gui, "Reading sidecars...", len(book_info_dict))
+            progress.show()
+            QApplication.processEvents()
+
+        for idx, (book_key, book_info) in enumerate(book_info_dict.items()):
+            sidecar_path = book_info['sidecar_path']
+            book_uuid = book_info['uuid']
+            app_id = book_info['application_id']
+            device_title = book_info['title']
+
+            debug_print(f'Phase 1 - Checking [{idx+1}/{len(book_info_dict)}]: {sidecar_path}')
+            debug_print(f'  Device title: {device_title}')
+            debug_print(f'  Device UUID: {book_uuid}')
+            debug_print(f'  Application ID (Calibre book_id): {app_id}')
+
+            sidecar_contents = self.get_sidecar(device, sidecar_path)
+            if isinstance(sidecar_contents, GetSidecarStatus):
+                debug_print(f'  SKIP: Sidecar status = {sidecar_contents}')
+                continue
+
+            # Use Calibre's matching (application_id) - this matches what Calibre shows in "On Device"
+            book_id = None
+
+            if app_id is not None:
+                # application_id is Calibre's book_id for matched books
+                # Convert to int if it's a string
+                try:
+                    book_id = int(app_id)
+                except (ValueError, TypeError):
+                    book_id = app_id
+                debug_print(f'  Using Calibre application_id: app_id={app_id} (type={type(app_id).__name__}), book_id={book_id}')
+            else:
+                debug_print(f'  No application_id - book not matched by Calibre')
+
+            if not book_id:
+                debug_print(f'  SKIP: Book not found in Calibre library!')
+                debug_print(f'  Hint: Neither application_id ({app_id}) nor UUID ({book_uuid}) matched')
+                continue
+
+            metadata = db.get_metadata(book_id)
+            debug_print(f'  Raw metadata type: {type(metadata)}')
+            debug_print(f'  Raw metadata title attr: {getattr(metadata, "title", "NO ATTR")}')
+            title = metadata.get('title', 'Unknown')
+            calibre_uuid = metadata.get('uuid', 'NO UUID')
+            debug_print(f'  Found in Calibre: "{title}" (book_id={book_id}, Calibre UUID: {calibre_uuid})')
+
+            # Cache for later use - use book_key for consistency
+            sidecar_cache[book_key] = (sidecar_contents, title, metadata, sidecar_path, book_id)
+            debug_print(f'  Added to cache')
+
+            # Detect conflicts - use calibre_uuid for conflict tracking
+            conflicts = self.detect_conflicts(
+                calibre_uuid, title, sidecar_path, metadata, sidecar_contents, 'to_calibre'
+            )
+            all_conflicts.extend(conflicts)
+            debug_print(f'  Conflicts found: {len(conflicts)}')
+
+            if not silent:
+                progress.setValue(idx + 1, title)
+                QApplication.processEvents()
+
+        if not silent:
+            progress.close()
+
+        debug_print(f'Phase 1 complete: {len(sidecar_cache)} books cached, {len(all_conflicts)} conflicts found')
+
+        # Phase 2: Show conflict resolution dialog if there are conflicts
+        resolved_conflicts = []
+        conflict_resolutions = {}  # book_uuid -> {field_name -> resolution}
+
+        if all_conflicts and not silent:
+            dialog = ConflictResolutionDialog(self.gui, all_conflicts, 'to_calibre')
+            if dialog.exec_() == QDialog.Accepted:
+                resolved_conflicts = dialog.get_resolved_conflicts()
+                # Build lookup: book_uuid -> {field_name -> resolution}
+                for conflict in resolved_conflicts:
+                    if conflict.book_uuid not in conflict_resolutions:
+                        conflict_resolutions[conflict.book_uuid] = {}
+                    conflict_resolutions[conflict.book_uuid][conflict.field_name] = conflict.resolution
+            else:
+                # User cancelled
+                info_dialog(
+                    self.gui,
+                    'Cancelled',
+                    'Sync from KOReader was cancelled.',
+                    show=True,
+                    show_copy_button=False
+                )
+                return None
+
+        # Phase 3: Perform sync with resolved conflicts
         class KOSyncWorker(QThread):
             progress_update = pyqtSignal(int, str)
             finished_signal = pyqtSignal(dict)
 
-            def __init__(self, action, db, sidecar_paths):
+            def __init__(self, action, db, book_info_dict, sidecar_cache, conflict_resolutions):
                 super().__init__()
                 self.action = action
                 self.db = db
-                self.sidecar_paths = sidecar_paths
+                self.book_info_dict = book_info_dict
+                self.sidecar_cache = sidecar_cache
+                self.conflict_resolutions = conflict_resolutions
 
             def run(self):
                 results = []
@@ -1101,98 +1646,104 @@ class KoreaderAction(InterfaceAction):
                 num_fail = 0
                 num_skip = 0
 
-                for idx, (book_uuid, sidecar_path) in enumerate(sidecar_paths.items()):
-                    debug_print('Trying to get sidecar from ', device,
-                                ', with sidecar_path: ', sidecar_path)
+                for idx, (book_key, book_info) in enumerate(self.book_info_dict.items()):
+                    sidecar_path = book_info['sidecar_path']
+                    book_uuid = book_info['uuid']
+                    app_id = book_info['application_id']
 
-                    # pre-checks before parsing
-                    if book_uuid is None:
-                        status = 'skipped, no UUID'
-                        append_results(results, None, status,
-                                       book_uuid, sidecar_path)
+                    debug_print(f'Processing sidecar [{idx+1}/{len(self.book_info_dict)}]: {sidecar_path}')
+                    debug_print(f'  Book key: {book_key}, UUID: {book_uuid}, app_id: {app_id}')
+
+                    # Use cached sidecar if available (cache uses book_key)
+                    if book_key in self.sidecar_cache:
+                        sidecar_contents, title, metadata, cached_path, book_id = self.sidecar_cache[book_key]
+                        calibre_uuid = metadata.get('uuid', 'NO UUID')
+                        debug_print(f'  Using cached sidecar for: {title} (calibre_uuid: {calibre_uuid})')
+                    else:
+                        debug_print(f'  Book key not in cache, skipping (not found in Calibre in Phase 1)')
+                        status = 'skipped, not found in Calibre library'
+                        debug_print(f'  SKIP: {status}')
+                        append_results(results, None, status, book_uuid or book_key, sidecar_path)
                         num_skip += 1
                         continue
 
-                    sidecar_contents = self.action.get_sidecar(
-                        device, sidecar_path)
-                    debug_print("sidecar_contents:", sidecar_contents)
-                    book_id = db.lookup_by_uuid(book_uuid)
-                    metadata = db.get_metadata(book_id)
-                    title = metadata.get('title')
                     self.progress_update.emit(idx + 1, title)
-                    if DEBUG: # Add time delay when debugging
+                    if DEBUG:
                         time.sleep(.4)
 
-                    if sidecar_contents is GetSidecarStatus.PATH_NOT_FOUND:
-                        status = ('skipped, sidecar does not exist '
-                                  '(seems like book is never opened)')
-                        append_results(results, title, status,
-                                       book_uuid, sidecar_path)
-                        num_skip += 1
-                        continue
-
-                    elif sidecar_contents is GetSidecarStatus.DECODE_FAILED:
-                        status = 'decoding is failed see debug for more details'
-                        append_results(results, title, status,
-                                       book_uuid, sidecar_path)
-                        num_fail += 1
-                        continue
-
-                    else:
-                        debug_print('sidecar_contents is found!')
-
                     keys_values_to_update = {}
+                    # Use calibre_uuid for conflict resolution lookup (that's what detect_conflicts uses)
+                    book_resolutions = self.conflict_resolutions.get(calibre_uuid, {})
+                    debug_print(f'  conflict_resolutions keys: {list(self.conflict_resolutions.keys())}')
+                    debug_print(f'  Looking up calibre_uuid: {calibre_uuid}')
+                    debug_print(f'  book_resolutions: {book_resolutions}')
 
                     for config_name, column in COLUMNS.items():
                         target = CONFIG[config_name]
 
                         if target == '':
-                            # No column mapped, so do not sync
                             continue
+
+                        # Check if this field has a resolution
+                        if config_name in book_resolutions:
+                            resolution = book_resolutions[config_name]
+                            debug_print(f'  Field {config_name}: resolution={resolution}')
+                            if resolution == 'calibre':
+                                # Keep Calibre value - don't update
+                                debug_print(f'    -> Keeping Calibre value')
+                                continue
+                            elif resolution == 'skip':
+                                # Skip this field
+                                debug_print(f'    -> Skipping')
+                                continue
+                            # resolution == 'device' means use device value (continue normally)
+                            debug_print(f'    -> Using device value')
 
                         # Special handling for date started/finished
                         if config_name == 'column_date_book_started':
-                            if metadata.get(target) is None and sidecar_contents['summary']['status'] == 'reading':
-                                sidecar_contents['calculated']['date_book_started'] = sidecar_contents['calculated'].get('date_status_changed')
+                            if metadata.get(target) is None and sidecar_contents.get('summary', {}).get('status') == 'reading':
+                                sidecar_contents.setdefault('calculated', {})['date_book_started'] = sidecar_contents.get('calculated', {}).get('date_status_changed')
                         if config_name == 'column_date_book_finished':
-                            if metadata.get(target) is None and sidecar_contents['summary']['status'] == 'complete':
-                                sidecar_contents['calculated']['date_book_finished'] = sidecar_contents['calculated'].get('date_status_changed')
+                            if metadata.get(target) is None and sidecar_contents.get('summary', {}).get('status') == 'complete':
+                                sidecar_contents.setdefault('calculated', {})['date_book_finished'] = sidecar_contents.get('calculated', {}).get('date_status_changed')
 
                         data_location = column['data_location']
                         value = sidecar_contents
 
                         for subproperty in data_location:
-                            if subproperty in value:
+                            if isinstance(value, dict) and subproperty in value:
                                 value = value[subproperty]
                             else:
-                                debug_print(
-                                    f'subproperty "{subproperty}" not found in value')
+                                debug_print(f'subproperty "{subproperty}" not found')
                                 value = None
                                 break
 
-                        if not value:
+                        if value is None:
                             continue
 
                         # Transform value if required
                         if 'transform' in column:
                             debug_print('transforming value for ', target)
-                            value = column['transform'](value)
+                            try:
+                                value = column['transform'](value)
+                            except Exception as e:
+                                debug_print(f'Transform failed: {e}')
+                                continue
 
                         keys_values_to_update[target] = value
 
+                    debug_print(f'  keys_values_to_update: {keys_values_to_update}')
                     operation_status, result = self.action.update_metadata(
-                        book_uuid, db, keys_values_to_update
+                        book_id, self.db, keys_values_to_update
                     )
 
-                    results.append(
-                        {
-                            **result,
-                            'title': title,
-                            'book_uuid': book_uuid,
-                            'sidecar_path': sidecar_path,
-                            **({'updated': json.dumps(keys_values_to_update, default=str)} if DEBUG else {})
-                        }
-                    )
+                    results.append({
+                        **result,
+                        'title': title,
+                        'book_uuid': calibre_uuid,
+                        'sidecar_path': sidecar_path,
+                        **({'updated': json.dumps(keys_values_to_update, default=str)} if DEBUG else {})
+                    })
 
                     if operation_status == OperationStatus.PASS:
                         num_success += 1
@@ -1200,16 +1751,20 @@ class KoreaderAction(InterfaceAction):
                         num_fail += 1
                     elif operation_status == OperationStatus.SKIP:
                         num_skip += 1
-                self.finished_signal.emit(
-                    {'results': results, 'num_success': num_success, 'num_fail': num_fail, 'num_skip': num_skip})
 
-        db = self.gui.current_db.new_api
+                self.finished_signal.emit({
+                    'results': results,
+                    'num_success': num_success,
+                    'num_fail': num_fail,
+                    'num_skip': num_skip
+                })
+
         startTime = time.perf_counter()
-        self.koSyncWorker = KOSyncWorker(self, db, sidecar_paths)
+        self.koSyncWorker = KOSyncWorker(self, db, book_info_dict, sidecar_cache, conflict_resolutions)
         progress_dialog = None
-        if not silent and len(sidecar_paths) > 10:
+        if not silent and len(book_info_dict) > 10:
             progress_dialog = ProgressDialog(
-                self.gui, "Syncing Sidecars...", len(sidecar_paths))
+                self.gui, "Syncing Sidecars...", len(book_info_dict))
             progress_dialog.show()
             self.koSyncWorker.progress_update.connect(progress_dialog.setValue)
 
@@ -1218,20 +1773,19 @@ class KoreaderAction(InterfaceAction):
                 if progress_dialog:
                     progress_dialog.close()
                 results_message = (
-                    f"Total targets found: {len(sidecar_paths)}\n\n"
+                    f"Total targets found: {len(book_info_dict)}\n\n"
                     f"Metadata sync succeeded for: {res['num_success']}\n"
                     f"Metadata sync skipped for: {res['num_skip']}\n"
                     f"Metadata sync failed for: {res['num_fail']}\n"
                     f"Time taken: {time.perf_counter() - startTime:.4f} seconds.\n\n"
                 )
-                # Sort by if error, then # of changes
                 res['results'].sort(key=lambda row: (
                     not row.get('error', False), -len(row)))
                 if res['num_success'] > 0 and res['num_fail'] == 0:
                     SyncCompletionDialog(
                         self.gui,
                         'Metadata sync finished',
-                        results_message + f'All looks good!\n\n',
+                        results_message + 'All looks good!\n\n',
                         res['results'],
                         'info'
                     )
@@ -1239,9 +1793,8 @@ class KoreaderAction(InterfaceAction):
                     SyncCompletionDialog(
                         self.gui,
                         'Some sync failed',
-                        results_message + f'There was some error during sync process!\n'
-                        f'Please investigate and report if it looks '
-                        f'like a bug\n\n',
+                        results_message + 'There was some error during sync process!\n'
+                        'Please investigate and report if it looks like a bug\n\n',
                         res['results'],
                         'error'
                     )
@@ -1249,11 +1802,9 @@ class KoreaderAction(InterfaceAction):
                     SyncCompletionDialog(
                         self.gui,
                         'No errors but not successful syncs',
-                        results_message + f'No errors but no successful syncs\n'
-                        f'Do you have book(s) which are ready to be '
-                        f'sync?\n'
-                        f'Please investigate and report if it looks '
-                        f'like a bug\n\n',
+                        results_message + 'No errors but no successful syncs\n'
+                        'Do you have book(s) which are ready to be sync?\n'
+                        'Please investigate and report if it looks like a bug\n\n',
                         res['results'],
                         'warn'
                     )
@@ -1261,7 +1812,7 @@ class KoreaderAction(InterfaceAction):
                     error_dialog(
                         self.gui,
                         'Edge case',
-                        results_message + f'Seems like and bug, please report ASAP\n\n',
+                        results_message + 'Seems like a bug, please report ASAP\n\n',
                         det_msg=json.dumps(res['results'], indent=2),
                         show=True,
                         show_copy_button=False
@@ -1395,3 +1946,160 @@ class SyncCompletionDialog(QDialog):
         table.horizontalHeader().setFixedHeight(20 * max_lines)  # Default = 20
 
         return table
+
+
+class ConflictResolutionDialog(QDialog):
+    """Dialog for resolving conflicts between Calibre and device metadata.
+
+    Shows a table of all conflicts with per-row resolution dropdowns.
+    Provides bulk action buttons and returns the resolved conflicts list.
+    """
+
+    def __init__(self, parent, conflicts: List[ConflictItem], direction: str):
+        super().__init__(parent)
+        self.conflicts = conflicts
+        self.direction = direction
+        self.resolution_combos = []
+
+        direction_label = "Calibre" if direction == "to_calibre" else "Device"
+        self.setWindowTitle(f'Conflict Resolution - Sync to {direction_label}')
+        self.setMinimumWidth(900)
+        self.setMinimumHeight(600)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # Header message
+        header_msg = (
+            f"The following books have values that differ between Calibre and the device.\n"
+            f"Choose which value to keep for each field. Direction: syncing to {direction_label}."
+        )
+        header_label = QLabel(header_msg)
+        header_label.setWordWrap(True)
+        layout.addWidget(header_label)
+
+        # Bulk action buttons
+        bulk_layout = QHBoxLayout()
+        keep_calibre_all = QPushButton("Keep All Calibre")
+        keep_calibre_all.clicked.connect(lambda: self.set_all_resolutions('calibre'))
+        bulk_layout.addWidget(keep_calibre_all)
+
+        keep_device_all = QPushButton("Keep All Device")
+        keep_device_all.clicked.connect(lambda: self.set_all_resolutions('device'))
+        bulk_layout.addWidget(keep_device_all)
+
+        skip_all = QPushButton("Skip All")
+        skip_all.clicked.connect(lambda: self.set_all_resolutions('skip'))
+        bulk_layout.addWidget(skip_all)
+
+        bulk_layout.addStretch()
+        layout.addLayout(bulk_layout)
+
+        # Create table
+        self.table = QTableWidget()
+        self.table.setRowCount(len(conflicts))
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels([
+            'Title', 'Field', 'Calibre Value', 'Device Value', 'Action'
+        ])
+        # Handle both PyQt5 and PyQt6 API differences
+        try:
+            select_rows = QAbstractItemView.SelectionBehavior.SelectRows
+        except AttributeError:
+            select_rows = QAbstractItemView.SelectRows
+        self.table.setSelectionBehavior(select_rows)
+        try:
+            stretch_mode = QHeaderView.ResizeMode.Stretch
+            fixed_mode = QHeaderView.ResizeMode.Fixed
+        except AttributeError:
+            stretch_mode = QHeaderView.Stretch
+            fixed_mode = QHeaderView.Fixed
+        self.table.horizontalHeader().setSectionResizeMode(stretch_mode)
+        self.table.horizontalHeader().setSectionResizeMode(4, fixed_mode)
+        self.table.setColumnWidth(4, 150)
+
+        for row, conflict in enumerate(conflicts):
+            # Title
+            title_item = QTableWidgetItem(conflict.book_title or 'Unknown')
+            title_item.setFlags(title_item.flags() & ~Qt.ItemIsEditable)
+            title_item.setToolTip(conflict.book_title or 'Unknown')
+            self.table.setItem(row, 0, title_item)
+
+            # Field name
+            field_item = QTableWidgetItem(conflict.field_display_name)
+            field_item.setFlags(field_item.flags() & ~Qt.ItemIsEditable)
+            field_item.setToolTip(conflict.field_name)
+            self.table.setItem(row, 1, field_item)
+
+            # Calibre value
+            calibre_str = self._format_value(conflict.calibre_value)
+            calibre_item = QTableWidgetItem(calibre_str)
+            calibre_item.setFlags(calibre_item.flags() & ~Qt.ItemIsEditable)
+            calibre_item.setToolTip(calibre_str)
+            self.table.setItem(row, 2, calibre_item)
+
+            # Device value
+            device_str = self._format_value(conflict.device_value)
+            device_item = QTableWidgetItem(device_str)
+            device_item.setFlags(device_item.flags() & ~Qt.ItemIsEditable)
+            device_item.setToolTip(device_str)
+            self.table.setItem(row, 3, device_item)
+
+            # Resolution dropdown
+            combo = QComboBox()
+            combo.addItems(['Skip', 'Keep Calibre', 'Keep Device'])
+            # Default based on sync direction:
+            # to_calibre (from device) -> Keep Device (index 2)
+            # to_device (from calibre) -> Keep Calibre (index 1)
+            default_idx = 2 if self.direction == 'to_calibre' else 1
+            combo.setCurrentIndex(default_idx)
+            self.table.setCellWidget(row, 4, combo)
+            self.resolution_combos.append(combo)
+
+        layout.addWidget(self.table)
+
+        # Bottom buttons
+        bottom_layout = QHBoxLayout()
+        bottom_layout.addStretch()
+
+        cancel_button = QPushButton("Cancel")
+        cancel_button.setIcon(QIcon.ic('dialog_close.png'))
+        cancel_button.clicked.connect(self.reject)
+        bottom_layout.addWidget(cancel_button)
+
+        apply_button = QPushButton("Apply")
+        apply_button.setIcon(QIcon.ic('ok.png'))
+        apply_button.clicked.connect(self.accept)
+        apply_button.setDefault(True)
+        bottom_layout.addWidget(apply_button)
+
+        layout.addLayout(bottom_layout)
+
+    def _format_value(self, value) -> str:
+        """Format a value for display in the table."""
+        if value is None:
+            return "(empty)"
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        if isinstance(value, float):
+            if value <= 1.0:
+                return f"{value:.2%}"
+            return f"{value:.2f}"
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M")
+        return str(value)
+
+    def set_all_resolutions(self, resolution: str):
+        """Set all dropdowns to the specified resolution."""
+        index_map = {'skip': 0, 'calibre': 1, 'device': 2}
+        idx = index_map.get(resolution, 0)
+        for combo in self.resolution_combos:
+            combo.setCurrentIndex(idx)
+
+    def get_resolved_conflicts(self) -> List[ConflictItem]:
+        """Get the list of conflicts with their resolutions set."""
+        resolution_map = {0: 'skip', 1: 'calibre', 2: 'device'}
+        for i, conflict in enumerate(self.conflicts):
+            combo = self.resolution_combos[i]
+            conflict.resolution = resolution_map.get(combo.currentIndex(), 'skip')
+        return self.conflicts
