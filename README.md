@@ -211,11 +211,39 @@ Use make to load the plugin into calibre and launch it:
 make dev
 ```
 
+For Flatpak installations of Calibre, use the `FLATPAK=1` flag:
+
+```shell
+make dev FLATPAK=1
+```
+
+### Makefile Targets
+
+| Target | Description |
+|--------|-------------|
+| `dev` | Load plugin source directly into Calibre and launch in debug mode |
+| `zip` | Create plugin ZIP file in `release/` directory |
+| `load` | Install ZIP from `release/` and launch Calibre in debug mode |
+| `release` | Full release workflow: update version → create zip → load |
+| `update_version` | Update version number in `__init__.py` and `pluginIndexKOReaderSync.txt` |
+| `tag` | Create and push git tag for current version |
+
+#### Flatpak Support
+
+All targets that interact with Calibre support Flatpak installations via the `FLATPAK` environment variable:
+
+```shell
+# Examples
+make dev FLATPAK=1
+make release FLATPAK=1
+make load FLATPAK=1
+```
+
 ### Release
 
 1. Update version in one file `version.txt`
-1. Use `make release` and it will update version, create zip, upload zip to
-   plugin directory
+1. Use `make release` (or `make release FLATPAK=1` for Flatpak) to update version,
+   create zip, and load into Calibre
 1. Push all changes
 1. Use `make tag` to create and push tag
 1. Create release in github, use pushed tag and upload created zip to the
