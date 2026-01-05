@@ -151,7 +151,3 @@ release
 
 # Temporary files
 .temp/
-
-# Test device/library folders
-dummy_device/
-dummy_library/
