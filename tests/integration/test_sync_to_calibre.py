@@ -74,8 +74,8 @@ def _run_koworker_synchronously(monkeypatch):
 
 
 def test_sync_to_calibre_applies_device_value_via_real_thread(qapp, monkeypatch):
-    # This is the one test exercising the PR's actual main sync path
-    # end-to-end: the real KOSyncWorker(QThread), Phase 1 -> Phase 3.
+    # The one test exercising the full path end-to-end: the real
+    # KOSyncWorker(QThread), Phase 1 -> Phase 3.
     _run_koworker_synchronously(monkeypatch)
     monkeypatch.setattr(action_module, 'CONFIG', _config(column_percent_read_int='#ko_progint'))
 

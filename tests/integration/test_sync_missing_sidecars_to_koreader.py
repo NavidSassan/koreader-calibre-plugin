@@ -39,11 +39,10 @@ def _book_info(sidecar_path, uuid, app_id, in_library='UUID'):
 
 
 def test_device_path_exists_correctly_splits_books(monkeypatch):
-    # Regression test for this session's fix: the split used to be a raw
-    # os.path.exists(sidecar_path) call, which only ever resolves True for
-    # USB/Folder devices. A device whose native .exists() driver method
-    # disagrees with the local filesystem (as any wireless driver would)
-    # must still be split correctly.
+    # A mocked device whose native .exists() driver method differs per
+    # path (as any wireless driver would) must still be split correctly -
+    # device_path_exists() works for both USB/Folder and wireless, unlike
+    # a raw os.path.exists() check would.
     action = _action(monkeypatch)
     action.get_paths = MagicMock(return_value={
         1: _book_info('Book1.sdr/metadata.epub.lua', 'uuid-1', 1),
@@ -87,8 +86,7 @@ def test_unmatched_book_falls_back_to_device_uuid(monkeypatch):
     # without a reconnect refreshing set_books_in_library()'s cache),
     # resolve_book_id() finds nothing even though the device's own uuid
     # would still resolve via db.lookup_by_uuid(). Fall back to that uuid
-    # rather than skipping the book outright - matches PR 1's
-    # sync_missing_sidecars_to_koreader() behavior for the same case.
+    # rather than skipping the book outright.
     action = _action(monkeypatch)
     action.get_paths = MagicMock(return_value={
         1: _book_info('Missing.sdr/metadata.epub.lua', 'device-uuid', None, in_library=None),
@@ -122,6 +120,28 @@ def test_book_with_matching_sidecar_and_no_conflicts_is_left_alone(monkeypatch):
 
     action.push_metadata_to_koreader_sidecar.assert_not_called()
     action.update_sidecar_fields.assert_not_called()
+
+
+def test_books_with_sidecar_falls_back_to_device_uuid_lookup(monkeypatch):
+    # Same staleness gap as the books_without_sidecar path (see
+    # test_unmatched_book_falls_back_to_device_uuid): if Calibre's matching
+    # cache has nothing for this book, fall back to a live
+    # db.lookup_by_uuid() instead of skipping conflict detection outright.
+    action = _action(monkeypatch)
+    action.get_paths = MagicMock(return_value={
+        1: _book_info('Existing.sdr/metadata.epub.lua', 'device-uuid', None, in_library=None),
+    })
+    device = action.get_connected_device.return_value
+    device.exists = MagicMock(return_value=True)
+    action.get_sidecar = MagicMock(return_value={'percent_finished': 0.1})
+    action.detect_conflicts = MagicMock(return_value=[])
+    action.gui.current_db.new_api.lookup_by_uuid.return_value = 42
+    action.gui.current_db.new_api.get_metadata.return_value = FakeMetadata(uuid='calibre-uuid', title='T')
+
+    action.sync_missing_sidecars_to_koreader(silent=True)
+
+    action.gui.current_db.new_api.lookup_by_uuid.assert_called_once_with('device-uuid')
+    action.detect_conflicts.assert_called_once()
 
 
 def test_resolved_conflict_applies_calibre_value_to_sidecar(monkeypatch):

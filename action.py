@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
+import copy
 import io
 import json
 import os
@@ -218,8 +219,9 @@ class KoreaderAction(InterfaceAction):
         self.extension_callback = None
 
         # Tracks whether Calibre has finished annotating the currently
-        # connected device's books with in_library/application_id. Used to
-        # guard the manual sync actions against racing ahead of that.
+        # connected device's books with in_library/application_id (see
+        # get_paths()). Used to guard the manual sync actions against
+        # racing ahead of that.
         self.device_ready = False
 
         # Overwrite icon with actual KOReader logo
@@ -445,16 +447,15 @@ class KoreaderAction(InterfaceAction):
             'KoreaderAction:get_paths:'
         )
 
-        # Use GUI's annotated book list instead of device.books() -
+        # Use Calibre's own GUI-annotated book list instead of device.books() -
         # device.books() returns fresh objects without in_library set, so
-        # books would silently fail to match. The GUI's memory_view.model().db
-        # has the annotated objects from set_books_in_library(), which is
-        # guaranteed populated by the time this is called (both callers
-        # check device_ready first - see genesis()). No fallback: matching
-        # via device.books() alone only ever covers application_id matches
-        # (missing UUID/DB_ID/AUTHOR/AUTH_SORT), which made which books
-        # synced depend on unpredictable internal GUI state - worse than
-        # surfacing a clear error.
+        # matching against it would have to rely on device-reported UUIDs
+        # alone (fragile - see issues #94, #99, #115, #165). The GUI's
+        # memory_view.model().db has the objects annotated by
+        # set_books_in_library(), which matches by UUID first but falls back
+        # to title/author, the same mechanism behind Calibre's "On Device"
+        # indicator. This is guaranteed populated by the time this is called
+        # (both callers check device_ready first - see genesis()).
         debug_print(f'Getting annotated books from GUI memory_view...')
         try:
             books = self.gui.memory_view.model().db
@@ -475,7 +476,7 @@ class KoreaderAction(InterfaceAction):
         book_info = {}
         for book in books:
             # Get matching info from Calibre
-            # in_library is set by Calibre to 'UUID', 'APP_ID', 'DB_ID', or None/False
+            # in_library is set by Calibre to 'UUID', 'APP_ID', 'DB_ID', 'AUTHOR', 'AUTH_SORT', or None/False
             # application_id is the matched book_id (integer) if matched, else may contain stale data
             app_id = getattr(book, 'application_id', None)
             in_library = getattr(book, 'in_library', None)
@@ -490,7 +491,9 @@ class KoreaderAction(InterfaceAction):
                 debug_print(f'Ignoring book in hidden folder: {book.path}')
                 continue
 
-            sidecar_path = re.sub(r'\.(\w+)$', r'.sdr/metadata.\1.lua', book.path)
+            sidecar_path = re.sub(
+                r'\.([^./\\]+)$', r'.sdr/metadata.\1.lua', book.path
+            )
 
             # Use a unique key - prefer application_id, fall back to uuid, then path
             key = app_id or book_uuid or book.path
@@ -499,7 +502,7 @@ class KoreaderAction(InterfaceAction):
                 'sidecar_path': sidecar_path,
                 'uuid': book_uuid,
                 'application_id': app_id,
-                'in_library': in_library,  # Calibre's match result: 'UUID', 'APP_ID', 'DB_ID', or None
+                'in_library': in_library,  # Calibre's match result: 'UUID', 'APP_ID', 'DB_ID', 'AUTHOR', 'AUTH_SORT', or None
                 'db_id': db_id,
                 'title': title,
                 'path': book.path
@@ -1098,7 +1101,6 @@ class KoreaderAction(InterfaceAction):
         )
 
         # Make a deep copy to avoid modifying the original
-        import copy
         modified_sidecar = copy.deepcopy(current_sidecar)
 
         # Remove 'calculated' key if present (it's not part of the real sidecar)
@@ -1136,7 +1138,7 @@ class KoreaderAction(InterfaceAction):
 
             # Navigate to parent dict and set the value
             target = modified_sidecar
-            for i, key in enumerate(data_location[:-1]):
+            for key in data_location[:-1]:
                 if key not in target:
                     target[key] = {}
                 target = target[key]
@@ -1242,7 +1244,12 @@ class KoreaderAction(InterfaceAction):
             try:
                 sidecar_path = book_info['sidecar_path']
                 book_uuid = book_info['uuid']
+                # Fall back to a live uuid lookup if Calibre's matching cache
+                # is stale relative to the library (it's only rebuilt on
+                # device reconnect, see set_books_in_library()).
                 book_id = self.resolve_book_id(book_info)
+                if not book_id and book_uuid:
+                    book_id = db.lookup_by_uuid(book_uuid)
                 if not book_id:
                     continue
 
@@ -1723,10 +1730,9 @@ class KoreaderAction(InterfaceAction):
         main()  # Runs scheduled_progress_sync
 
     def sync_to_calibre(self, silent=False):
-        """This plugin's main purpose. It syncs the contents of
-        KOReader's metadata sidecar files into calibre's metadata.
-
-        Now includes conflict detection: before syncing, compares device
+        """This plugin’s main purpose. It syncs the contents of
+        KOReader’s metadata sidecar files into calibre’s metadata.
+        Includes conflict detection: before syncing, compares device
         and Calibre values and shows a resolution dialog for conflicts.
 
         :return:
@@ -1904,7 +1910,7 @@ class KoreaderAction(InterfaceAction):
                         continue
 
                     self.progress_update.emit(idx + 1, title)
-                    if DEBUG:
+                    if DEBUG: # Add time delay when debugging
                         time.sleep(.4)
 
                     keys_values_to_update = {}
@@ -1918,6 +1924,7 @@ class KoreaderAction(InterfaceAction):
                         target = CONFIG[config_name]
 
                         if target == '':
+                            # No column mapped, so do not sync
                             continue
 
                         # Check if this field has a resolution
@@ -1952,7 +1959,8 @@ class KoreaderAction(InterfaceAction):
                             if isinstance(value, dict) and subproperty in value:
                                 value = value[subproperty]
                             else:
-                                debug_print(f'subproperty "{subproperty}" not found')
+                                debug_print(
+                                    f'subproperty "{subproperty}" not found in value')
                                 value = None
                                 break
 
@@ -2027,6 +2035,7 @@ class KoreaderAction(InterfaceAction):
                     f"Metadata sync failed for: {res['num_fail']}\n"
                     f"Time taken: {time.perf_counter() - startTime:.4f} seconds.\n\n"
                 )
+                # Sort by if error, then # of changes
                 res['results'].sort(key=lambda row: (
                     not row.get('error', False), -len(row)))
                 if res['num_success'] > 0 and res['num_fail'] == 0:
@@ -2042,7 +2051,8 @@ class KoreaderAction(InterfaceAction):
                         self.gui,
                         'Some sync failed',
                         results_message + 'There was some error during sync process!\n'
-                        'Please investigate and report if it looks like a bug\n\n',
+                        'Please investigate and report if it looks '
+                        'like a bug\n\n',
                         res['results'],
                         'error'
                     )
@@ -2051,8 +2061,10 @@ class KoreaderAction(InterfaceAction):
                         self.gui,
                         'No errors but not successful syncs',
                         results_message + 'No errors but no successful syncs\n'
-                        'Do you have book(s) which are ready to be sync?\n'
-                        'Please investigate and report if it looks like a bug\n\n',
+                        'Do you have book(s) which are ready to be '
+                        'sync?\n'
+                        'Please investigate and report if it looks '
+                        'like a bug\n\n',
                         res['results'],
                         'warn'
                     )
