@@ -218,8 +218,7 @@ class KoreaderAction(InterfaceAction):
         self.extension_callback = None
 
         # Tracks whether Calibre has finished annotating the currently
-        # connected device's books with in_library/application_id (see
-        # SYNC_ARCHITECTURE.md's "GUI matching timing" section). Used to
+        # connected device's books with in_library/application_id. Used to
         # guard the manual sync actions against racing ahead of that.
         self.device_ready = False
 
