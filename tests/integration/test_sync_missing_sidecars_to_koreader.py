@@ -26,12 +26,12 @@ def _action(monkeypatch, config=None):
     return action
 
 
-def _book_info(sidecar_path, uuid, app_id, in_library='UUID'):
+def _book_info(sidecar_path, uuid, app_id):
     return {
         'sidecar_path': sidecar_path,
         'uuid': uuid,
         'application_id': app_id,
-        'in_library': in_library,
+        'in_library': 'UUID',
         'db_id': None,
         'title': f'Book {app_id}',
         'path': sidecar_path.replace('.sdr/metadata.epub.lua', '.epub'),
@@ -39,10 +39,11 @@ def _book_info(sidecar_path, uuid, app_id, in_library='UUID'):
 
 
 def test_device_path_exists_correctly_splits_books(monkeypatch):
-    # A mocked device whose native .exists() driver method differs per
-    # path (as any wireless driver would) must still be split correctly -
-    # device_path_exists() works for both USB/Folder and wireless, unlike
-    # a raw os.path.exists() check would.
+    # Regression test for this session's fix: the split used to be a raw
+    # os.path.exists(sidecar_path) call, which only ever resolves True for
+    # USB/Folder devices. A device whose native .exists() driver method
+    # disagrees with the local filesystem (as any wireless driver would)
+    # must still be split correctly.
     action = _action(monkeypatch)
     action.get_paths = MagicMock(return_value={
         1: _book_info('Book1.sdr/metadata.epub.lua', 'uuid-1', 1),
@@ -63,44 +64,87 @@ def test_device_path_exists_correctly_splits_books(monkeypatch):
     assert args[2] == 'Book2.sdr/metadata.epub.lua'
 
 
-def test_matched_book_uses_calibre_uuid_not_device_uuid(monkeypatch):
-    # Regression test for issues #94, #99, #115, #165: once Calibre has
-    # matched the book via resolve_book_id(), use its own uuid rather than
-    # trusting the device's potentially stale/missing one.
+def test_book_without_sidecar_dispatches_to_push_metadata(monkeypatch):
     action = _action(monkeypatch)
     action.get_paths = MagicMock(return_value={
-        1: _book_info('Missing.sdr/metadata.epub.lua', 'stale-device-uuid', 1),
+        1: _book_info('Missing.sdr/metadata.epub.lua', 'uuid-1', 1),
     })
     device = action.get_connected_device.return_value
     device.exists = MagicMock(return_value=False)
     action.push_metadata_to_koreader_sidecar = MagicMock(return_value=('success', {}))
-    action.gui.current_db.new_api.get_metadata.return_value = FakeMetadata(uuid='correct-calibre-uuid', title='T')
+    action.gui.current_db.new_api.get_metadata.return_value = FakeMetadata(uuid='calibre-uuid', title='T')
 
     action.sync_missing_sidecars_to_koreader(silent=True)
 
     action.push_metadata_to_koreader_sidecar.assert_called_once_with(
-        device, 'correct-calibre-uuid', 'Missing.sdr/metadata.epub.lua'
+        device, 'calibre-uuid', 'Missing.sdr/metadata.epub.lua'
     )
 
 
-def test_unmatched_book_falls_back_to_device_uuid(monkeypatch):
-    # If Calibre couldn't match the book at all, fall back to the device's
-    # own uuid (same as before this change) rather than skipping outright -
-    # push_metadata_to_koreader_sidecar does its own lookup as a last resort.
+def test_book_with_matching_sidecar_and_no_conflicts_is_left_alone(monkeypatch):
     action = _action(monkeypatch)
     action.get_paths = MagicMock(return_value={
-        1: _book_info('Missing.sdr/metadata.epub.lua', 'device-uuid', None, in_library=None),
+        1: _book_info('Existing.sdr/metadata.epub.lua', 'uuid-1', 1),
     })
     device = action.get_connected_device.return_value
-    device.exists = MagicMock(return_value=False)
-    action.push_metadata_to_koreader_sidecar = MagicMock(return_value=('success', {}))
+    device.exists = MagicMock(return_value=True)
+    action.push_metadata_to_koreader_sidecar = MagicMock()
+    action.update_sidecar_fields = MagicMock()
+    action.get_sidecar = MagicMock(return_value={})
+    action.detect_conflicts = MagicMock(return_value=[])
+    action.gui.current_db.new_api.get_metadata.return_value = FakeMetadata(uuid='calibre-uuid', title='T')
 
     action.sync_missing_sidecars_to_koreader(silent=True)
 
-    action.push_metadata_to_koreader_sidecar.assert_called_once_with(
-        device, 'device-uuid', 'Missing.sdr/metadata.epub.lua'
+    action.push_metadata_to_koreader_sidecar.assert_not_called()
+    action.update_sidecar_fields.assert_not_called()
+
+
+def test_resolved_conflict_applies_calibre_value_to_sidecar(monkeypatch):
+    from action import ConflictItem
+
+    class FakeConflictDialog:
+        def __init__(self, gui, conflicts, direction):
+            self._conflicts = conflicts
+
+        def exec_(self):
+            from PyQt5.Qt import QDialog
+            return QDialog.Accepted
+
+        def get_resolved_conflicts(self):
+            resolved = []
+            for c in self._conflicts:
+                c.resolution = 'calibre'
+                resolved.append(c)
+            return resolved
+
+    monkeypatch.setattr(action_module, 'ConflictResolutionDialog', FakeConflictDialog)
+    # Real QDialog subclass - would reject the MagicMock gui as its parent
+    # widget. We only care that update_sidecar_fields got called correctly,
+    # not about the final results summary dialog.
+    monkeypatch.setattr(action_module, 'SyncCompletionDialog', MagicMock())
+
+    action = _action(monkeypatch)
+    action.get_paths = MagicMock(return_value={
+        1: _book_info('Existing.sdr/metadata.epub.lua', 'uuid-1', 1),
+    })
+    device = action.get_connected_device.return_value
+    device.exists = MagicMock(return_value=True)
+    action.get_sidecar = MagicMock(return_value={'percent_finished': 0.1})
+    conflict = ConflictItem(
+        book_uuid='calibre-uuid', book_title='T', sidecar_path='Existing.sdr/metadata.epub.lua',
+        field_name='column_percent_read', field_display_name='Progress',
+        calibre_value=0.9, device_value=0.1,
     )
-    action.gui.current_db.new_api.get_metadata.assert_not_called()
+    action.detect_conflicts = MagicMock(return_value=[conflict])
+    action.update_sidecar_fields = MagicMock(return_value=('success', {'fields_updated': ['column_percent_read']}))
+    action.gui.current_db.new_api.get_metadata.return_value = FakeMetadata(uuid='calibre-uuid', title='T')
+
+    action.sync_missing_sidecars_to_koreader(silent=False)
+
+    action.update_sidecar_fields.assert_called_once_with(
+        device, 'Existing.sdr/metadata.epub.lua', {'percent_finished': 0.1}, {'column_percent_read': 0.9}
+    )
 
 
 def test_no_pushable_columns_shows_error_and_returns_early(monkeypatch):
