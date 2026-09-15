@@ -1,9 +1,10 @@
 
 import os
 import sqlite3
-import pytest
 from unittest.mock import MagicMock
+
 from action import KoreaderAction
+
 
 def test_dummy_data_consistency():
     # Verify dummy_library metadata.db
@@ -24,23 +25,31 @@ def test_dummy_data_consistency():
     assert os.path.exists(os.path.join('dummy_device', thoreau_path))
 
 def test_get_paths_with_dummy_device():
-    # Mock book objects as they would come from a real device driver
+    # Mock book objects as Calibre's GUI would annotate them in
+    # gui.memory_view.model().db (set_books_in_library() sets in_library /
+    # application_id) - this is get_paths()'s primary source, not
+    # device.books() directly. See SYNC_ARCHITECTURE.md.
     class MockBook:
-        def __init__(self, uuid, path):
+        def __init__(self, uuid, path, application_id, title):
             self.uuid = uuid
             self.path = path
+            self.application_id = application_id
+            self.in_library = 'UUID'
+            self.db_id = None
+            self.title = title
 
     alice_book = MockBook(
         uuid='43bd8264-96fa-461a-a05e-1d1cb245d34f',
-        path="Carroll, Lewis/Alice's Adventures in Wonderland - Lewis Carroll.epub"
+        path="Carroll, Lewis/Alice's Adventures in Wonderland - Lewis Carroll.epub",
+        application_id=1,
+        title="Alice's Adventures in Wonderland",
     )
     thoreau_book = MockBook(
         uuid='3393747a-f0d8-44e1-bfaf-5fad857da3eb',
-        path="Thoreau, Henry David/Walden, and On The Duty Of Civil Disobedience - Henry David Thoreau.epub"
+        path="Thoreau, Henry David/Walden, and On The Duty Of Civil Disobedience - Henry David Thoreau.epub",
+        application_id=2,
+        title="Walden, and On The Duty Of Civil Disobedience",
     )
-
-    mock_device = MagicMock()
-    mock_device.books.return_value = [alice_book, thoreau_book]
 
     # Instantiate action with mocks for parent and site_customization
     mock_parent = MagicMock()
@@ -49,9 +58,14 @@ def test_get_paths_with_dummy_device():
     mock_site_customization.version = (0, 8, 0)
 
     action = KoreaderAction(mock_parent, mock_site_customization)
-    paths = action.get_paths(mock_device)
+    action.gui.memory_view.model.return_value.db = [alice_book, thoreau_book]
+
+    paths = action.get_paths()
 
     assert len(paths) == 2
-    # Verify Alice's sidecar path generation
-    alice_sidecar = next(p for u, p in paths if u == alice_book.uuid)
-    assert alice_sidecar == "Carroll, Lewis/Alice's Adventures in Wonderland - Lewis Carroll.sdr/metadata.epub.lua"
+    # Keyed by application_id; verify Alice's sidecar path generation and
+    # that the in_library annotation survived into the result.
+    alice_entry = paths[1]
+    assert alice_entry['sidecar_path'] == "Carroll, Lewis/Alice's Adventures in Wonderland - Lewis Carroll.sdr/metadata.epub.lua"
+    assert alice_entry['uuid'] == alice_book.uuid
+    assert alice_entry['in_library'] == 'UUID'

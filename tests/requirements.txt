@@ -1,0 +1,4 @@
+pytest
+pytest-qt
+PyQt5
+six

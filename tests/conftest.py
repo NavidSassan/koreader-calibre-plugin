@@ -55,6 +55,7 @@ calibre_gui2.actions.InterfaceAction = MockInterfaceAction
 calibre_gui2.device = MagicMock()
 calibre_gui2.show_restart_warning = MagicMock()
 calibre_gui2.error_dialog = MagicMock()
+calibre_gui2.info_dialog = MagicMock()
 calibre_gui2.warning_dialog = MagicMock()
 calibre_gui2.open_url = MagicMock()
 
