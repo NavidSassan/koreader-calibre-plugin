@@ -56,6 +56,7 @@ from calibre.gui2.actions import InterfaceAction
 from calibre.gui2.device import device_signals
 from calibre.gui2 import (
     error_dialog,
+    info_dialog,
     warning_dialog,
     open_url,
 )
@@ -198,6 +199,12 @@ class KoreaderAction(InterfaceAction):
             self.version = f'{base.name} (v{".".join(map(str, base.version))})'
         self.extension_callback = None
 
+        # Tracks whether Calibre has finished annotating the currently
+        # connected device's books with in_library/application_id (see
+        # get_paths()). Used to guard the manual sync actions against
+        # racing ahead of that.
+        self.device_ready = False
+
         # Overwrite icon with actual KOReader logo
         icon = get_icons(
             'images/icon.png'
@@ -265,6 +272,14 @@ class KoreaderAction(InterfaceAction):
         # Start the scheduled progress sync if enabled
         if CONFIG["checkbox_enable_scheduled_progressync"]:
             self.scheduled_progress_sync()
+
+        # Track device readiness regardless of the automatic-sync setting,
+        # so the manual sync actions can also tell when it's safe to trust
+        # Calibre's in_library annotations (see device_ready above).
+        device_signals.device_connection_changed.connect(
+            self._on_device_connection_changed)
+        device_signals.device_metadata_available.connect(
+            self._mark_device_ready)
 
         # Start the device connection watcher if enabled
         if CONFIG["checkbox_enable_automatic_sync"]:
@@ -392,28 +407,66 @@ class KoreaderAction(InterfaceAction):
     def _on_device_metadata_available(self):
         self.sync_to_calibre(silent=not DEBUG)
 
-    def get_paths(self, device):
+    def _on_device_connection_changed(self, _connected):
+        # Fires on both connect and disconnect; either way the annotations
+        # from the previous connection (if any) no longer apply.
+        self.device_ready = False
+
+    def _mark_device_ready(self):
+        self.device_ready = True
+
+    def get_paths(self):
         """Retrieves paths to sidecars of all books in calibre's library
         on the device
 
-        :param device: a device object
-        :return: a list of (uuid, path) tuples to sidecars
+        :return: a dict of book_keys with corresponding book info dicts, or
+                 None if Calibre's device-matching info could not be read.
+                 Each book info dict contains: sidecar_path, uuid, application_id, title
         """
         debug_print = partial(
             module_debug_print,
             'KoreaderAction:get_paths:'
         )
 
-        debug_print(
-            f'found {len(device.books())} paths to books:\n\t',
-            '\n\t'.join([book.path for book in device.books()])
-        )
+        # Use Calibre's own GUI-annotated book list instead of device.books() -
+        # device.books() returns fresh objects without in_library set, so
+        # matching against it would have to rely on device-reported UUIDs
+        # alone (fragile - see issues #94, #99, #115, #165). The GUI's
+        # memory_view.model().db has the objects annotated by
+        # set_books_in_library(), which matches by UUID first but falls back
+        # to title/author, the same mechanism behind Calibre's "On Device"
+        # indicator. This is guaranteed populated by the time this is called
+        # (both callers check device_ready first - see genesis()).
+        debug_print(f'Getting annotated books from GUI memory_view...')
+        try:
+            books = self.gui.memory_view.model().db
+            debug_print(f'  Got {len(books)} books from memory_view.model().db')
+        except Exception as e:
+            debug_print(f'  Failed to get annotated books: {e}')
+            error_dialog(
+                self.gui,
+                'Could not read device book list',
+                'Calibre\'s device book list could not be read. Please '
+                'disconnect and reconnect the device, then try again.',
+                det_msg=str(e),
+                show=True,
+                show_copy_button=False
+            )
+            return None
 
-        for book in device.books():
-            debug_print(f'uuid to path: {book.uuid} - {book.path}')
+        book_info = {}
+        for book in books:
+            # Get matching info from Calibre
+            # in_library is set by Calibre to 'UUID', 'APP_ID', 'DB_ID', 'AUTHOR', 'AUTH_SORT', or None/False
+            # application_id is the matched book_id (integer) if matched, else may contain stale data
+            app_id = getattr(book, 'application_id', None)
+            in_library = getattr(book, 'in_library', None)
+            book_uuid = getattr(book, 'uuid', None)
+            db_id = getattr(book, 'db_id', None)
+            title = getattr(book, 'title', 'Unknown')
 
-        paths = []
-        for book in device.books():
+            debug_print(f'Book: "{title}" - uuid={book_uuid}, application_id={app_id}, in_library={in_library}, db_id={db_id}, path={book.path}')
+
             # Ignore hidden folders (issue #101)
             if any(part.startswith('.') for part in book.path.replace('\\\\', '/').split('/')):
                 debug_print(f'Ignoring book in hidden folder: {book.path}')
@@ -422,15 +475,70 @@ class KoreaderAction(InterfaceAction):
             sidecar_path = re.sub(
                 r'\.([^./\\]+)$', r'.sdr/metadata.\1.lua', book.path
             )
-            paths.append((book.uuid, sidecar_path))
 
+            # Use a unique key - prefer application_id, fall back to uuid, then path
+            key = app_id or book_uuid or book.path
+
+            book_info[key] = {
+                'sidecar_path': sidecar_path,
+                'uuid': book_uuid,
+                'application_id': app_id,
+                'in_library': in_library,  # Calibre's match result: 'UUID', 'APP_ID', 'DB_ID', 'AUTHOR', 'AUTH_SORT', or None
+                'db_id': db_id,
+                'title': title,
+                'path': book.path
+            }
 
         debug_print(
-            f'generated {len(paths)} path(s) to sidecar Lua files:\n\t',
-            '\n\t'.join([p[1] for p in paths])
+            f'generated {len(book_info)} path(s) to sidecar Lua files:\n\t',
+            '\n\t'.join([info['sidecar_path'] for info in book_info.values()])
         )
 
-        return paths
+        return book_info
+
+    def resolve_book_id(self, book_info):
+        """Resolve a Calibre book_id from Calibre's own device-matching info.
+
+        Mirrors the logic behind Calibre's "On Device" indicator, using the
+        in_library/application_id/db_id attributes get_paths() collected.
+
+        :param book_info: one entry from get_paths()'s returned dict
+        :return: an int book_id, or None if Calibre did not match this book
+        """
+        debug_print = partial(
+            module_debug_print,
+            'KoreaderAction:resolve_book_id:'
+        )
+
+        in_library = book_info.get('in_library')
+        if not in_library:
+            debug_print(f'SKIP: Calibre did not match this book (in_library={in_library})')
+            return None
+
+        debug_print(f'Calibre matched via: {in_library}')
+
+        db_id = book_info.get('db_id')
+        app_id = book_info.get('application_id')
+        book_id = None
+
+        if in_library == 'DB_ID' and db_id is not None:
+            book_id = db_id
+        elif app_id is not None:
+            try:
+                book_id = int(app_id)
+            except (ValueError, TypeError):
+                debug_print(f'ERROR: Calibre matched but application_id is not int: {app_id}')
+                return None
+
+        if not book_id:
+            debug_print(
+                f'SKIP: Could not get book_id from Calibre match '
+                f'(in_library={in_library}, app_id={app_id}, db_id={db_id})'
+            )
+            return None
+
+        debug_print(f'Using Calibre-matched book_id: {book_id}')
+        return book_id
 
     def get_sidecar(self, device, path):
         """Requests the given path from the given device and returns the
@@ -487,28 +595,10 @@ class KoreaderAction(InterfaceAction):
 
         return parsed_contents
 
-    def get_calibre_uuid_from_sidecar(self, sidecar_contents):
-        """Extracts the calibre UUID from sidecar identifiers if present.
-        (Issue #115)
-        """
-        if not isinstance(sidecar_contents, dict):
-            return None
-        stats = sidecar_contents.get('stats', {})
-        identifiers_str = stats.get('identifiers', '')
-        if not identifiers_str:
-            return None
-
-        # KOReader uses both space and \ as separators in some versions
-        parts = re.split(r'[\s\\]+', identifiers_str)
-        for part in parts:
-            if part.startswith('calibre:'):
-                return part.replace('calibre:', '').strip()
-        return None
-
-    def update_metadata(self, uuid, db, keys_values_to_update):
+    def update_metadata(self, book_id_or_uuid, db, keys_values_to_update):
         """Update multiple metadata columns for the given book.
 
-        :param uuid: identifier for the book
+        :param book_id_or_uuid: either a numeric book_id or a UUID string
         :param keys_values_to_update: a dict of keys to update with values
         :return: a dict of values that can be used to report back to the user
         """
@@ -517,16 +607,23 @@ class KoreaderAction(InterfaceAction):
             'KoreaderAction:update_metadata:'
         )
 
+        # If we got a numeric book_id, use it directly; otherwise look up by UUID
+        # Handle int, numpy int, or string that looks like an int
         try:
-            debug_print('Looking for uuid in calibre db: ', uuid)
-            book_id = db.lookup_by_uuid(uuid)
-        except:
-            book_id = None
+            book_id = int(book_id_or_uuid)
+            debug_print(f'Using book_id directly: {book_id}')
+        except (ValueError, TypeError):
+            # It's a UUID string, look it up
+            try:
+                debug_print('Looking for uuid in calibre db: ', book_id_or_uuid)
+                book_id = db.lookup_by_uuid(book_id_or_uuid)
+            except:
+                book_id = None
 
         if not book_id:
-            debug_print(f'could not find {uuid} in calibre\'s library')
+            debug_print(f'could not find {book_id_or_uuid} in calibre\'s library')
             return OperationStatus.SKIP, {
-                'result': 'could not find uuid in calibre\'s library, have you deleted this book from library?'}
+                'result': 'could not find book in calibre\'s library, have you deleted this book from library?'}
 
         # Get the current metadata for the book from the library
         metadata = db.get_metadata(book_id)
@@ -632,23 +729,29 @@ class KoreaderAction(InterfaceAction):
         if len(updates) == 0:
             updateLog['result'] = 'no updates needed'
             debug_print(
-                'no changed metadata for uuid = ', uuid,
-                ', id = ', book_id
+                'no changed metadata for book_id = ', book_id
             )
         elif DEBUG and DRY_RUN:
             debug_print(
-                'would have updated the following fields for uuid = ',
-                uuid, ', id = ', book_id, ': ', updates
+                'would have updated the following fields for book_id = ',
+                book_id, ': ', updates
             )
         else:
-            db.set_metadata(
-                book_id, metadata, set_title=False,
-                set_authors=False
-            )
-            debug_print(
-                'updated the following fields for uuid = ', uuid,
-                ', id = ', book_id, ': ', updates
-            )
+            try:
+                db.set_metadata(
+                    book_id, metadata, set_title=False,
+                    set_authors=False
+                )
+                debug_print(
+                    'updated the following fields for book_id = ', book_id,
+                    ': ', updates
+                )
+            except Exception as e:
+                debug_print(f'Failed to set metadata for book_id {book_id}: {e}')
+                return OperationStatus.FAIL, {
+                    'result': f'Failed to update: {str(e)}',
+                    'error': True
+                }
 
         return OperationStatus.PASS, {
             'result': 'success',
@@ -874,8 +977,24 @@ class KoreaderAction(InterfaceAction):
         if not self.check_device(device):
             return None
 
-        sidecar_paths = self.get_paths(device)
-        debug_print('sidecar_paths: ', sidecar_paths)
+        if not self.device_ready:
+            debug_print('device not ready yet (Calibre has not finished matching it), aborting')
+            if not silent:
+                info_dialog(
+                    self.gui,
+                    'Device still loading',
+                    'Calibre is still matching this device\'s books against your '
+                    'library. Please wait a moment and try again.',
+                    show=True,
+                    show_copy_button=False
+                )
+            return None
+
+        db = self.gui.current_db.new_api
+        book_info_dict = self.get_paths()
+        if book_info_dict is None:
+            return None
+        debug_print('book_info_dict: ', book_info_dict)
 
         results = []
         num_processed = 0
@@ -884,23 +1003,35 @@ class KoreaderAction(InterfaceAction):
         num_fail = 0
         num_skipped_existing = 0
 
-        for book_uuid, path in sidecar_paths:
+        for book_key, book_info in book_info_dict.items():
+            sidecar_path = book_info['sidecar_path']
+            book_uuid = book_info['uuid']
+
             # Check if exists first (issue #122 revisited)
-            if self.device_path_exists(device, path):
-                debug_print(f"Skipping existing sidecar: {path}")
+            if self.device_path_exists(device, sidecar_path):
+                debug_print(f"Skipping existing sidecar: {sidecar_path}")
                 num_skipped_existing += 1
                 continue
 
+            # Use Calibre's own matching to get a trustworthy uuid where
+            # possible (issues #94, #99, #115, #165); fall back to the
+            # device's own uuid, same as before, if Calibre didn't match it.
+            book_id = self.resolve_book_id(book_info)
+            calibre_uuid = None
+            if book_id:
+                metadata = db.get_metadata(book_id)
+                calibre_uuid = metadata.get('uuid')
+
             num_processed += 1
-            result, details = self.push_metadata_to_koreader_sidecar(device, book_uuid,
-                                                                     path)
+            result, details = self.push_metadata_to_koreader_sidecar(
+                device, calibre_uuid or book_uuid, sidecar_path)
             if result == "success":
                 num_success += 1
                 results.append(
                     {
                         **details,
-                        'book_uuid': book_uuid,
-                        'sidecar_path': path,
+                        'book_uuid': calibre_uuid or book_uuid,
+                        'sidecar_path': sidecar_path,
                     }
                 )
             elif result == "failure":
@@ -908,8 +1039,8 @@ class KoreaderAction(InterfaceAction):
                 results.append(
                     {
                         **details,
-                        'book_uuid': book_uuid,
-                        'sidecar_path': path,
+                        'book_uuid': calibre_uuid or book_uuid,
+                        'sidecar_path': sidecar_path,
                     }
                 )
             elif result == "no_metadata":
@@ -917,14 +1048,14 @@ class KoreaderAction(InterfaceAction):
                 results.append(
                     {
                         **details,
-                        'book_uuid': book_uuid,
-                        'sidecar_path': path,
+                        'book_uuid': calibre_uuid or book_uuid,
+                        'sidecar_path': sidecar_path,
                     }
                 )
 
         if not silent:
             results_message = (
-                f'{len(sidecar_paths)} books on device.\n'
+                f'{len(book_info_dict)} books on device.\n'
                 f'{num_skipped_existing} books already have sidecars (skipped).\n'
                 f'Sidecar creation succeeded for {num_success}.\n'
                 f'Sidecar creation failed for {num_fail}.\n'
@@ -1217,18 +1348,33 @@ class KoreaderAction(InterfaceAction):
         if not self.check_device(device):
             return None
 
-        sidecar_paths = self.get_paths(device)
-        debug_print('sidecar_paths:', sidecar_paths)
+        if not self.device_ready:
+            debug_print('device not ready yet (Calibre has not finished matching it), aborting')
+            if not silent:
+                info_dialog(
+                    self.gui,
+                    'Device still loading',
+                    'Calibre is still matching this device\'s books against your '
+                    'library. Please wait a moment and try again.',
+                    show=True,
+                    show_copy_button=False
+                )
+            return None
+
+        book_info_dict = self.get_paths()
+        if book_info_dict is None:
+            return None
+        debug_print('book_info_dict:', book_info_dict)
 
         class KOSyncWorker(QThread):
             progress_update = pyqtSignal(int, str)
             finished_signal = pyqtSignal(dict)
 
-            def __init__(self, action, db, sidecar_paths):
+            def __init__(self, action, db, book_info_dict):
                 super().__init__()
                 self.action = action
                 self.db = db
-                self.sidecar_paths = sidecar_paths
+                self.book_info_dict = book_info_dict
 
             def run(self):
                 results = []
@@ -1236,14 +1382,19 @@ class KoreaderAction(InterfaceAction):
                 num_fail = 0
                 num_skip = 0
 
-                for idx, (book_uuid, sidecar_path) in enumerate(self.sidecar_paths):
+                for idx, (book_key, book_info) in enumerate(self.book_info_dict.items()):
+                    sidecar_path = book_info['sidecar_path']
+                    book_uuid = book_info['uuid']
+
                     debug_print('Trying to get sidecar from ', device,
                                 ', with sidecar_path: ', sidecar_path)
 
-                    # pre-checks before parsing
-                    if book_uuid is None:
-                        status = 'skipped, no UUID'
-                        append_results(results, None, status,
+                    # Use Calibre's own matching, the same mechanism behind
+                    # its "On Device" indicator - see get_paths()/resolve_book_id().
+                    book_id = self.action.resolve_book_id(book_info)
+                    if not book_id:
+                        status = 'skipped, not matched by Calibre'
+                        append_results(results, book_info.get('title'), status,
                                        book_uuid, sidecar_path)
                         num_skip += 1
                         continue
@@ -1252,28 +1403,8 @@ class KoreaderAction(InterfaceAction):
                         device, sidecar_path)
                     debug_print("sidecar_contents:", sidecar_contents)
 
-                    try:
-                        book_id = db.lookup_by_uuid(book_uuid)
-                        if not book_id:
-                            # Try to find a better UUID in the sidecar (Issue #115)
-                            better_uuid = self.action.get_calibre_uuid_from_sidecar(sidecar_contents)
-                            if better_uuid:
-                                debug_print(f"Found alternative UUID in sidecar: {better_uuid}")
-                                book_id = db.lookup_by_uuid(better_uuid)
-                                if book_id:
-                                    book_uuid = better_uuid # Use the one that worked
-
-                        if not book_id:
-                            raise Exception("Book not found")
-                        metadata = db.get_metadata(book_id)
-                        title = metadata.get('title')
-                    except Exception as e:
-                        debug_print(f"Failed to lookup book {book_uuid}: {e}")
-                        status = 'skipped, could not find in library'
-                        append_results(results, "Unknown", status,
-                                       book_uuid, sidecar_path)
-                        num_skip += 1
-                        continue
+                    metadata = db.get_metadata(book_id)
+                    title = metadata.get('title')
 
                     self.progress_update.emit(idx + 1, title)
                     if DEBUG: # Add time delay when debugging
@@ -1344,7 +1475,7 @@ class KoreaderAction(InterfaceAction):
                         keys_values_to_update[target] = value
 
                     operation_status, result = self.action.update_metadata(
-                        book_uuid, db, keys_values_to_update)
+                        book_id, db, keys_values_to_update)
 
 
                     results.append(
@@ -1368,11 +1499,11 @@ class KoreaderAction(InterfaceAction):
 
         db = self.gui.current_db.new_api
         startTime = time.perf_counter()
-        self.koSyncWorker = KOSyncWorker(self, db, sidecar_paths)
+        self.koSyncWorker = KOSyncWorker(self, db, book_info_dict)
         progress_dialog = None
-        if not silent and len(sidecar_paths) > 10:
+        if not silent and len(book_info_dict) > 10:
             progress_dialog = ProgressDialog(
-                self.gui, "Syncing Sidecars...", len(sidecar_paths))
+                self.gui, "Syncing Sidecars...", len(book_info_dict))
             progress_dialog.show()
             self.koSyncWorker.progress_update.connect(progress_dialog.setValue)
 
@@ -1381,7 +1512,7 @@ class KoreaderAction(InterfaceAction):
                 if progress_dialog:
                     progress_dialog.close()
                 results_message = (
-                    f"Total targets found: {len(sidecar_paths)}\n\n"
+                    f"Total targets found: {len(book_info_dict)}\n\n"
                     f"Metadata sync succeeded for: {res['num_success']}\n"
                     f"Metadata sync skipped for: {res['num_skip']}\n"
                     f"Metadata sync failed for: {res['num_fail']}\n"
