@@ -106,20 +106,49 @@ def test_sync_to_calibre_skips_book_with_no_sidecar(qapp, monkeypatch):
     action.gui.current_db.new_api.set_metadata.assert_not_called()
 
 
-def test_sync_to_calibre_skips_book_calibre_did_not_match(qapp, monkeypatch):
+def test_sync_to_calibre_skips_book_calibre_and_uuid_lookup_both_fail(qapp, monkeypatch):
     _run_koworker_synchronously(monkeypatch)
     monkeypatch.setattr(action_module, 'CONFIG', _config())
 
     action = _action()
-    # in_library falsy and no application_id -> resolve_book_id() returns None
+    # in_library falsy and no application_id -> resolve_book_id() returns
+    # None; db.lookup_by_uuid() also finds nothing -> genuinely unmatched.
     action.get_paths = MagicMock(return_value={
         'Author/Book.epub': _book_info(app_id=None, in_library=None)
     })
+    action.gui.current_db.new_api.lookup_by_uuid.return_value = None
 
     action.sync_to_calibre(silent=True)
 
     action.gui.current_db.new_api.get_metadata.assert_not_called()
     action.gui.current_db.new_api.set_metadata.assert_not_called()
+
+
+def test_sync_to_calibre_falls_back_to_device_uuid_lookup(qapp, monkeypatch):
+    # If Calibre's own matching cache is stale relative to the live library
+    # (e.g. a book was added to the library after the device connected -
+    # set_books_in_library() only refreshes its cache on reconnect),
+    # resolve_book_id() finds nothing even though db.lookup_by_uuid() would
+    # still resolve it live. Fall back to that rather than skipping - matches
+    # what upstream `main` always did as its primary (only) lookup.
+    _run_koworker_synchronously(monkeypatch)
+    monkeypatch.setattr(action_module, 'CONFIG', _config(column_percent_read_int='#ko_progint'))
+
+    action = _action()
+    action.get_paths = MagicMock(return_value={
+        1: _book_info(app_id=None, in_library=None, uuid='device-uuid')
+    })
+    action.get_sidecar = MagicMock(return_value={'percent_finished': 0.75})
+    action.gui.current_db.new_api.lookup_by_uuid.return_value = 42
+
+    metadata = FakeMetadata({'#ko_progint': 50, 'uuid': 'calibre-uuid', 'title': 'Calibre Title'})
+    action.gui.current_db.new_api.get_metadata.return_value = metadata
+
+    action.sync_to_calibre(silent=True)
+
+    action.gui.current_db.new_api.lookup_by_uuid.assert_called_once_with('device-uuid')
+    assert metadata['#ko_progint'] == 75
+    action.gui.current_db.new_api.set_metadata.assert_called_once()
 
 
 def test_device_not_ready_aborts_without_touching_device(qapp, monkeypatch):
