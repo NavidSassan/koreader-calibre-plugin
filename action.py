@@ -1393,8 +1393,7 @@ class KoreaderAction(InterfaceAction):
                     # its "On Device" indicator - see get_paths()/resolve_book_id().
                     # Fall back to a live uuid lookup if Calibre's matching
                     # cache is stale relative to the library (it's only
-                    # rebuilt on device reconnect, see set_books_in_library())
-                    # - this is what `main` always did as its primary lookup.
+                    # rebuilt on device reconnect, see set_books_in_library()).
                     book_id = self.action.resolve_book_id(book_info)
                     if not book_id and book_uuid:
                         book_id = db.lookup_by_uuid(book_uuid)

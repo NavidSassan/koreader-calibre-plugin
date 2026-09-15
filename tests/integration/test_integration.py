@@ -2,9 +2,7 @@
 import os
 import sqlite3
 from unittest.mock import MagicMock
-
 from action import KoreaderAction
-
 
 def test_dummy_data_consistency():
     # Verify dummy_library metadata.db
@@ -20,7 +18,7 @@ def test_dummy_data_consistency():
     # Verify dummy_device paths
     alice_path = "Carroll, Lewis/Alice's Adventures in Wonderland - Lewis Carroll.epub"
     thoreau_path = "Thoreau, Henry David/Walden, and On The Duty Of Civil Disobedience - Henry David Thoreau.epub"
-    
+
     assert os.path.exists(os.path.join('dummy_device', alice_path))
     assert os.path.exists(os.path.join('dummy_device', thoreau_path))
 
@@ -28,7 +26,7 @@ def test_get_paths_with_dummy_device():
     # Mock book objects as Calibre's GUI would annotate them in
     # gui.memory_view.model().db (set_books_in_library() sets in_library /
     # application_id) - this is get_paths()'s primary source, not
-    # device.books() directly. See SYNC_ARCHITECTURE.md.
+    # device.books() directly.
     class MockBook:
         def __init__(self, uuid, path, application_id, title):
             self.uuid = uuid
