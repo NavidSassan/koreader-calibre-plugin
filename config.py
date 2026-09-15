@@ -91,6 +91,8 @@ CUSTOM_COLUMN_DEFAULTS = {
         'data_source': 'sidecar',
         'data_location': ['percent_finished'],
         'transform': (lambda value: float(value)),
+        'reverse_transform': (lambda value: float(value) if value is not None else None),
+        'push_to_device': True,
     },
     'column_percent_read_int': {
         'column_heading': _("KOReader Progress"),
@@ -103,6 +105,8 @@ CUSTOM_COLUMN_DEFAULTS = {
         'data_source': 'sidecar',
         'data_location': ['percent_finished'],
         'transform': (lambda value: round(float(value) * 100)),
+        'reverse_transform': (lambda value: value / 100.0 if value is not None else None),
+        'push_to_device': True,
     },
     'column_status': {
         'column_heading': _("KOReader Book Status"),
@@ -115,6 +119,8 @@ CUSTOM_COLUMN_DEFAULTS = {
                              '"Reading", "On hold").'),
         'data_source': 'sidecar',
         'data_location': ['summary', 'status'],
+        'reverse_transform': (lambda value: value),
+        'push_to_device': True,
     },
     'column_status_bool': {
         'column_heading': _("KOReader Book Status Y/N"),
@@ -127,6 +133,8 @@ CUSTOM_COLUMN_DEFAULTS = {
         'data_source': 'sidecar',
         'data_location': ['summary', 'status'],
         'transform': (lambda val: bool(val == 'complete')),
+        'reverse_transform': (lambda value: 'complete' if value else 'reading'),
+        'push_to_device': True,
     },
     'column_last_read_location': {
         'column_heading': _("KOReader Last Location"),
@@ -138,6 +146,8 @@ CUSTOM_COLUMN_DEFAULTS = {
                              'stopped reading at.'),
         'data_source': 'sidecar',
         'data_location': ['last_xpointer'],
+        'reverse_transform': (lambda value: value),
+        'push_to_device': True,
     },
     'column_date_book_started': {
         'column_heading': _("Date KOReader Started"),
@@ -149,6 +159,7 @@ CUSTOM_COLUMN_DEFAULTS = {
                              'Will only be set once when synced with reading status.'),
         'data_source': 'sidecar',
         'data_location': ['calculated', 'date_book_started'],
+        'push_to_device': False,  # Calculated field, not stored in sidecar
     },
     'column_date_book_finished': {
         'column_heading': _("Date KOReader Finished"),
@@ -160,6 +171,7 @@ CUSTOM_COLUMN_DEFAULTS = {
                              'Will only be set once when synced with finished status.'),
         'data_source': 'sidecar',
         'data_location': ['calculated', 'date_book_finished'],
+        'push_to_device': False,  # Calculated field, not stored in sidecar
     },
     'column_rating': {
         'first_in_group': True,
@@ -169,11 +181,13 @@ CUSTOM_COLUMN_DEFAULTS = {
         'default_lookup_name': '#ko_rating',
         'config_label': _('Rating column:'),
         'config_tool_tip': _('A "Rating" column to store your rating of the book,\n'
-                             'as entered on the book’s status page.'),
+                             "as entered on the book's status page."),
         'data_source': 'sidecar',
         'data_location': ['summary', 'rating'],
         # calibre uses a 10-point scale,
         'transform': (lambda value: value * 2),
+        'reverse_transform': (lambda value: value // 2 if value is not None else None),
+        'push_to_device': True,
     },
     'column_review': {  # Unsure about Interpret this column as
         'column_heading': _("KOReader Review"),
@@ -182,9 +196,11 @@ CUSTOM_COLUMN_DEFAULTS = {
         'default_lookup_name': '#ko_review',
         'config_label': _('Review column:'),
         'config_tool_tip': _('A "Long text" column to store your review of the book,\n'
-                             'as entered on the book’s status page.'),
+                             "as entered on the book's status page."),
         'data_source': 'sidecar',
         'data_location': ['summary', 'note'],
+        'reverse_transform': (lambda value: value),
+        'push_to_device': True,
     },
     'column_bookmarks': {
         'column_heading': _("KOReader Bookmarks"),
@@ -196,6 +212,7 @@ CUSTOM_COLUMN_DEFAULTS = {
         'data_source': 'sidecar',
         'data_location': ['annotations'],
         'transform': clean_bookmarks,
+        'push_to_device': False,  # HTML transformed, not reversible
     },
     'column_md5': {
         'first_in_group': True,
@@ -209,6 +226,8 @@ CUSTOM_COLUMN_DEFAULTS = {
                              'in the KOReader app.)'),
         'data_source': 'sidecar',
         'data_location': ['partial_md5_checksum'],
+        'reverse_transform': (lambda value: value),
+        'push_to_device': True,
     },
     'column_device_name': {
         'column_heading': _("KOReader Device Name"),
@@ -241,6 +260,7 @@ CUSTOM_COLUMN_DEFAULTS = {
         'config_tool_tip': _('A "Date" column to store when the last sync was performed.'),
         'data_source': 'sidecar',
         'data_location': ['calculated', 'date_synced'],
+        'push_to_device': False,  # Calculated field, not stored in sidecar
     },
     'column_date_sidecar_modified': {
         'column_heading': _("Date KOReader Modified"),
@@ -253,6 +273,7 @@ CUSTOM_COLUMN_DEFAULTS = {
                              'always empty'),
         'data_source': 'sidecar',
         'data_location': ['calculated', 'date_sidecar_modified'],
+        'push_to_device': False,  # Calculated field, not stored in sidecar
     },
     'column_sidecar': {  # Unsure about Interpret this column as
         'column_heading': _("KOReader Raw Sidecar"),
@@ -271,6 +292,7 @@ CUSTOM_COLUMN_DEFAULTS = {
             indent=2,
             default=str
         )),
+        'push_to_device': False,  # Raw backup column, used separately for full sidecar restore
     },
 }
 
