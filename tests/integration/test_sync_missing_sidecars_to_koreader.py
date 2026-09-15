@@ -26,12 +26,12 @@ def _action(monkeypatch, config=None):
     return action
 
 
-def _book_info(sidecar_path, uuid, app_id):
+def _book_info(sidecar_path, uuid, app_id, in_library='UUID'):
     return {
         'sidecar_path': sidecar_path,
         'uuid': uuid,
         'application_id': app_id,
-        'in_library': 'UUID',
+        'in_library': in_library,
         'db_id': None,
         'title': f'Book {app_id}',
         'path': sidecar_path.replace('.sdr/metadata.epub.lua', '.epub'),
@@ -79,6 +79,30 @@ def test_book_without_sidecar_dispatches_to_push_metadata(monkeypatch):
     action.push_metadata_to_koreader_sidecar.assert_called_once_with(
         device, 'calibre-uuid', 'Missing.sdr/metadata.epub.lua'
     )
+
+
+def test_unmatched_book_falls_back_to_device_uuid(monkeypatch):
+    # If Calibre's own matching cache is stale relative to the live library
+    # (e.g. the book was added to the library after the device connected,
+    # without a reconnect refreshing set_books_in_library()'s cache),
+    # resolve_book_id() finds nothing even though the device's own uuid
+    # would still resolve via db.lookup_by_uuid(). Fall back to that uuid
+    # rather than skipping the book outright - matches PR 1's
+    # sync_missing_sidecars_to_koreader() behavior for the same case.
+    action = _action(monkeypatch)
+    action.get_paths = MagicMock(return_value={
+        1: _book_info('Missing.sdr/metadata.epub.lua', 'device-uuid', None, in_library=None),
+    })
+    device = action.get_connected_device.return_value
+    device.exists = MagicMock(return_value=False)
+    action.push_metadata_to_koreader_sidecar = MagicMock(return_value=('success', {}))
+
+    action.sync_missing_sidecars_to_koreader(silent=True)
+
+    action.push_metadata_to_koreader_sidecar.assert_called_once_with(
+        device, 'device-uuid', 'Missing.sdr/metadata.epub.lua'
+    )
+    action.gui.current_db.new_api.get_metadata.assert_not_called()
 
 
 def test_book_with_matching_sidecar_and_no_conflicts_is_left_alone(monkeypatch):

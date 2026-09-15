@@ -1301,14 +1301,20 @@ class KoreaderAction(InterfaceAction):
                 sidecar_path = book_info['sidecar_path']
                 book_uuid = book_info['uuid']
                 book_id = self.resolve_book_id(book_info)
-                if not book_id:
-                    continue
+                calibre_uuid = None
+                metadata = None
+                title = book_info.get('title', 'Unknown')
+                if book_id:
+                    metadata = db.get_metadata(book_id)
+                    calibre_uuid = metadata.get('uuid')
+                    title = metadata.get('title', 'Unknown')
 
-                metadata = db.get_metadata(book_id)
-                calibre_uuid = metadata.get('uuid')
-                title = metadata.get('title', 'Unknown')
-
-                # Use calibre_uuid for push_metadata_to_koreader_sidecar
+                # Use Calibre's own uuid where possible; fall back to the
+                # device's own uuid, same as before, if Calibre didn't match
+                # it (its matching cache can be stale relative to the live
+                # library - see PR 1's sync_missing_sidecars_to_koreader()).
+                # push_metadata_to_koreader_sidecar() does its own uuid
+                # lookup as a last resort.
                 result, details = self.push_metadata_to_koreader_sidecar(device, calibre_uuid or book_uuid, sidecar_path)
 
                 if result == "success":
